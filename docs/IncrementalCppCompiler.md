@@ -55,12 +55,18 @@ object files or debug info serialization.
   extensions. Demonstrates that a single person/small team can build a working C++
   compiler targeting real-world code.
 
+- **SN-Systems Program Repository** (Sony, 2018–2022): LLVM-based research project
+  that replaced object files with a content-addressed database (pstore). Proved that
+  storing compilation results in a database with minimal stamp files for build system
+  compatibility works at scale.
+  [https://github.com/SNSystems/llvm-project-prepo/wiki](https://github.com/SNSystems/llvm-project-prepo/wiki)
+
 **forgecc** differs from all of these by **unifying compilation, linking, loading,
 debugging, and distributed caching into a single daemon process**.
 
 ### Non-Goals (for the proof-of-concept)
 
-- No 32-bit support, no ARM
+- No 32-bit support, no ARM64
 - No ELF/Mach-O/DWARF (architecture allows future extension)
 - No optimization passes beyond trivial ones (dead code elimination, constant folding)
 - No standalone compiler/linker tools — everything lives inside the daemon
@@ -365,7 +371,14 @@ that must compile as C.
 
 ### 4.4 Parser
 
-Recursive descent parser (like Clang), producing an AST.
+Recursive descent parser (like Clang), producing an AST. **Parsing is inherently
+sequential** within a TU because C++ is context-dependent: whether a name refers to a
+type or a value affects how subsequent tokens are parsed (e.g., `T * p;` is a pointer
+declaration if `T` is a type, or a multiplication if `T` is a value). `typedef`,
+`using`, class/struct/enum declarations, and template declarations all change the
+parsing context for everything that follows. This means the parser must process
+top-level declarations in order — there is no practical way to parallelize C++ parsing
+within a single file. (Parallelism across TUs is unaffected.)
 
 **C++20 features needed** (based on UE5/Game codebase analysis):
 
@@ -485,13 +498,20 @@ forge-sema/
 - Each module is independently testable
 - Memoization hooks at every module boundary
 
-**Parallelism in Sema**: Unlike Clang which processes a TU sequentially:
-- Top-level declarations can be type-checked in parallel (they're independent until
-  they reference each other)
-- Template instantiations can be parallelized (each instantiation is independent)
-- Function bodies can be type-checked in parallel once their signatures are resolved
+**Parallelism in Sema**: Sema has a **sequential spine** and **parallel fan-out**:
+
+- **Sequential (the "spine")**: Top-level declaration signatures must be processed in
+  declaration order, because each declaration can reference types and names introduced
+  by earlier declarations. This is the same ordering constraint as parsing — a function
+  signature can use a class declared above it, so signatures are resolved top-to-bottom.
+- **Parallel (the "fan-out")**: Once all signatures in a TU are resolved, **function
+  bodies** can be type-checked in parallel — each body only reads from the shared type
+  table (populated during the sequential phase) and does not modify it. This is a
+  read-heavy workload ideal for shared-memory multithreading (`RwLock` / `DashMap`).
+  **Template instantiations** are also parallelized (each instantiation is independent
+  once the template definition and arguments are known).
 - The `SemaContext` uses concurrent data structures (lock-free maps for type tables,
-  read-write locks for scope stacks)
+  read-write locks for scope stacks) to support the parallel phase.
 
 **MSVC ABI compatibility** (critical for UE5):
 - Name mangling scheme (Microsoft C++ mangling, not Itanium)
@@ -784,7 +804,13 @@ the DAP-based debugging path is the primary focus.
 
 ### 4.9 Linker
 
-The linker reads from the same content-addressed store the compiler writes to.
+The linker reads from the same content-addressed store the compiler writes to. It
+**never reads .obj files from disk**. When the build system sends a link command with
+`.obj` paths (e.g., `POST /v1/link`), the daemon resolves each path through the
+**build index** (see §4.11) to find the corresponding content key, then retrieves
+sections, symbols, and relocations from the store. In JIT mode, the daemon responds
+to the build system immediately after linking completes; JIT injection into the target
+process happens asynchronously and does not block the build system.
 
 **Two modes**:
 
@@ -801,6 +827,8 @@ The linker reads from the same content-addressed store the compiler writes to.
    - Generate PDB (only needed for release mode — DAP handles dev debugging)
    - Handle `#pragma comment(lib, ...)` and default libraries
    - Read import libraries (.lib) for Windows SDK / third-party DLLs
+   - For interop with external linkers (link.exe, lld), real `.obj` files can be
+     materialized from the store on demand (future work, see §4.13)
 
 **UE5 DLL structure**: The Game editor target builds **~190 modules** (see §15.5),
 each as a separate DLL. The `*_API` macro pattern (`CORE_API`, `ENGINE_API`, etc.)
@@ -846,6 +874,7 @@ Accept: application/msgpack
 // Decoded request body (shown as JSON for readability):
 {
     "source_file": "Game/Source/Game/Foo.cpp",
+    "output": "build/Game/Foo.obj",
     "include_paths": ["Engine/Source/Runtime/Core/Public", ...],
     "definitions": ["UE_BUILD_DEVELOPMENT=1", "WITH_EDITOR=1", ...],
     "force_includes": ["SharedPCH.Engine.h"],
@@ -855,14 +884,32 @@ Accept: application/msgpack
 // Response:
 {
     "status": "success",
-    "diagnostics": [],
-    "artifacts": { "object_key": "blake3:abc123..." }
+    "content_key": "blake3:abc123...",
+    "diagnostics": []
 }
 ```
 
-**UBT integration uses clang-cl mode.** The Game project already uses clang-cl
-(confirmed via `HVN_START(CLOUD-1590, Enable clang-cl for Game)` markers in
-`VCToolChain.cs`). Clang-cl mode uses fewer MSVC-specific flags, has cleaner
+**Compile output — shallow .obj files**: The build system specifies an `output` path
+where it expects an `.obj` file (e.g., `build/Game/Foo.obj`). When compilation
+completes, the daemon: (1) stores the result in the content-addressed store,
+(2) updates the **build index** (see §4.11) mapping `output` → `content_key`, and
+(3) kicks off an **async background write** of a shallow `.obj` to disk. The HTTP
+response is sent immediately after steps 1–2; the file write is non-blocking.
+
+The shallow `.obj` is a valid COFF file with a proper header, but containing only a
+small `.forgeid` section with metadata (source file path, flags hash, content key).
+No `.text`, `.data`, or other real sections. It is a few hundred bytes and exists
+solely to satisfy the build system's timestamp-based dependency tracking. The daemon's
+own pipeline never reads these files back — the `content_key` in the HTTP response
+(and the build index) is the canonical reference to the compilation result.
+
+This approach is inspired by
+[SN-Systems' Program Repository](https://github.com/SNSystems/llvm-project-prepo/wiki)
+(Sony, 2018–2022), which proved that storing compilation results in a database while
+writing minimal stamp files for build system compatibility is practical at scale.
+
+**UBT integration uses clang-cl mode.** The Game project already uses clang-cl.
+Clang-cl mode uses fewer MSVC-specific flags, has cleaner
 semantics, and maps naturally to **forgecc**'s internal representation.
 
 UBT modifications needed: A new `ForgeccToolChain.cs` that constructs `ForgeccCompileAction`
@@ -877,8 +924,10 @@ forgecc-daemon
     │
     ├── HTTP Server (unified protocol — serves UBT, peers, and DAP)
     │   ├── /v1/compile      — build system submits compile actions
+    │   ├── /v1/link         — build system submits link actions
     │   ├── /v1/artifact/    — content-addressed artifact get/put (local + P2P)
     │   └── /v1/peers        — peer discovery (gossip protocol)
+    ├── Build Index (output path → content key, persisted in redb)
     ├── P2P Network (seed-based discovery, DHT)
     ├── Build Scheduler (parallel task graph)
     ├── File Watcher (pre-compilation on save)
@@ -915,6 +964,36 @@ occurs at multiple levels:
   can be processed in parallel
 - **Across pipeline stages**: Pipelining — TU1's codegen can run while TU2 is still parsing
 - **Across machines**: Via the distributed store, machines share work
+
+**Build index**: The daemon maintains an in-memory **build index** that maps output
+paths (e.g., `build/Game/Foo.obj`) to content keys in the store. This is the bridge
+between the build system's file-oriented world and **forgecc**'s content-addressed
+world. When a compilation completes, the daemon updates the build index and kicks off
+an async background write of the shallow `.obj` to disk (non-blocking — the HTTP
+response is sent immediately). When the daemon later receives a link command with
+`.obj` paths on the command line, it resolves each path through the build index to
+find the corresponding content key — it never reads the `.obj` files from disk.
+
+The build index is persisted to the local redb store as a dedicated table. Since redb
+is ACID, writes are safe even if the daemon crashes mid-update. On restart, the daemon
+loads the build index from redb — recovery is instant, no recompilation needed. This
+is essentially the daemon's equivalent of a `.ninja_log` file, but stored in the same
+database as all other compilation artifacts.
+
+**Workspace binding**: Each daemon instance is bound to a **workspace root** — a
+specific directory tree (git repo, Perforce workspace, or arbitrary source tree):
+
+```toml
+# forgecc.toml
+[workspace]
+root = "C:/src/Game"    # or auto-detected from .git / P4CONFIG
+```
+
+All paths in the build index are stored **relative to the workspace root** (consistent
+with the determinism requirements in §17). This means the build index is portable if
+the workspace moves, and different developers with different checkout paths produce
+identical content keys. One daemon per workspace — if you have two projects, you run
+two daemons.
 
 ### 4.12 Distributed P2P Network (IPFS-like)
 
@@ -1077,12 +1156,19 @@ output.
 | Endpoint | Method | Purpose | Used by |
 |---|---|---|---|
 | `/v1/compile` | POST | Submit compile action(s) | Build system (UBT, ninja) |
+| `/v1/link` | POST | Submit link action (.obj paths resolved via build index) | Build system (UBT, ninja) |
 | `/v1/status` | GET | Daemon status, build progress | Build system, CLI tools |
 | `/v1/artifact/{hash}` | GET | Fetch artifact by content hash | Peers, `forge-verify` |
 | `/v1/artifact/{hash}` | PUT | Store/announce artifact | Peers |
 | `/v1/peers` | GET | List known peers | Peers (gossip) |
 | `/v1/peers` | POST | Register as peer | Peers (gossip) |
 | `/v1/debug/*` | various | DAP-over-HTTP tunnel (see §4.8) | Non-VS Code debugger clients |
+
+**Future: real .obj materialization** (deferred, not needed for PoC): The
+`/v1/artifact/{hash}?format=coff` endpoint could reconstruct a full COFF `.obj` file
+from the store. This would be useful for `forge-verify` (diffing against reference
+compilers), external linker interop (link.exe, lld), and inspection with
+dumpbin/llvm-objdump.
 
 **Note on DAP transport**: VS Code's standard DAP integration uses **JSON-over-stdio**
 (VS Code launches the debug adapter as a child process). The daemon supports this as
@@ -1557,9 +1643,9 @@ adds execution-level and structural comparison on top.
 
 1. Connects to the **forgecc** daemon via HTTP (`POST /v1/compile`)
 2. Requests compilation of a source file (or set of files)
-3. Collects the generated COFF sections / machine code from the daemon
-4. Writes them to a temporary `.obj` file
-5. Compares against a reference `.obj` produced by MSVC or clang-cl using:
+3. Materializes a temporary `.obj` file from the store (via
+   `/v1/artifact/{hash}?format=coff` — see §4.13)
+4. Compares against a reference `.obj` produced by MSVC or clang-cl using:
    - **`llvm-debuginfo-analyzer --compare`**: debug info (CodeView) correctness
    - **`llvm-objdump --disassemble`**: instruction-level comparison (structural, not
      byte-identical — register allocation will differ)
@@ -1660,17 +1746,34 @@ make/ninja. The daemon has full knowledge of the dependency graph and can schedu
 optimally.
 
 ### 12.2 Within a Translation Unit
-- **Lexer/Preprocessor**: Sequential per file (token order matters), but different
-  included files can be preprocessed in parallel.
-- **Parser**: Top-level declarations can be parsed independently once we identify
-  declaration boundaries (a lightweight pre-scan).
-- **Sema**: 
-  - Function bodies are type-checked in parallel (they're independent once signatures
-    are resolved)
-  - Template instantiations are parallelized (each is independent)
-  - Type table and scope stack use concurrent data structures (`DashMap`, `RwLock`)
-- **IR lowering**: Each function is lowered independently → trivially parallel
-- **CodeGen**: Each function is compiled independently → trivially parallel
+
+Intra-TU parallelism follows a **sequential spine → parallel fan-out** model.
+The first three stages are inherently sequential due to C++'s context-dependent
+grammar and declaration-order semantics; the later stages fan out to all cores:
+
+- **Lexer/Preprocessor** (sequential): Token order matters. The preprocessor must
+  process `#include` directives in order because each header is preprocessed in the
+  macro context established by everything before it. Different `#include`d files can
+  only be preprocessed in parallel if they are guarded (`#pragma once` / include
+  guards) and don't depend on external macro state.
+- **Parser** (sequential): C++ parsing is context-dependent — whether a name is a
+  type or a value affects how subsequent tokens are parsed. `typedef`, `using`,
+  class/struct/enum declarations all change the parsing context. Top-level
+  declarations must be parsed in order.
+- **Sema — signatures** (sequential): Declaration signatures must be resolved
+  top-to-bottom because each can reference types introduced by earlier declarations.
+- **Sema — function bodies** (parallel): Once all signatures are resolved, function
+  bodies can be type-checked concurrently. Each body only reads from the shared type
+  table (`DashMap`, `RwLock`) — a read-heavy workload ideal for multithreading.
+  Template instantiations are also parallelized (each is independent).
+- **IR lowering** (parallel): Each function is lowered independently → trivially
+  parallel via rayon.
+- **CodeGen** (parallel): Each function is compiled independently → trivially
+  parallel via rayon.
+
+The sequential spine (lex → parse → sema signatures) produces the work items
+(function bodies, template instantiations) that then fan out across all cores.
+For a large TU with hundreds of functions, the parallel phase dominates.
 
 ### 12.3 Pipeline Parallelism
 Different TUs can be at different pipeline stages simultaneously:
@@ -1687,9 +1790,10 @@ For a TU that takes 2–3 minutes on a single core today (without caching):
 
 | Stage | Parallelism potential | Estimated savings (8 cores) |
 |---|---|---|
-| Preprocessing | `#include`d files can be preprocessed in parallel | 10–20% of preprocess time |
-| Parsing | Top-level declarations independent after boundary scan | Modest — parsing is 5–10% of total |
-| Sema | Function bodies + template instantiations in parallel | **30–50%** of Sema time |
+| Preprocessing | Sequential; limited parallelism for guarded includes | Minimal |
+| Parsing | Sequential (context-dependent grammar) | None |
+| Sema — signatures | Sequential (declaration order) | None |
+| Sema — bodies | Function bodies + template instantiations in parallel | **30–50%** of Sema time |
 | IR lowering | Per-function, trivially parallel | **60–80%** |
 | CodeGen | Per-function, trivially parallel | **60–80%** |
 

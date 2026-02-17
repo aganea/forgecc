@@ -133,58 +133,58 @@ debugging, and distributed caching into a single daemon process**.
 │  │  HTTP Server (axum) — unified endpoint :9473                 │    │
 │  │  /v1/compile, /v1/artifact/*, /v1/peers, /v1/debug/*         │    │
 │  └──────────┬──────────────┬──────────────────┬─────────────────┘    │
-│             │              │                  │                       │
-│  ┌──────────▼──┐  ┌───────▼────────┐  ┌──────▼───────────────┐      │
-│  │  Build      │  │  P2P Network   │  │  Content-Addressed   │      │
-│  │  Scheduler  │──│  (seeds,       │──│  Distributed Store   │      │
-│  │             │  │   IPFS-like)   │  │  (local + remote)    │      │
-│  └──────┬──────┘  └────────────────┘  └──────────┬───────────┘      │
+│             │              │                  │                      │
+│  ┌──────────▼──┐  ┌───────▼────────┐  ┌──────▼───────────────┐       │
+│  │  Build      │  │  P2P Network   │  │  Content-Addressed   │       │
+│  │  Scheduler  │──│  (seeds,       │──│  Distributed Store   │       │
+│  │             │  │   IPFS-like)   │  │  (local + remote)    │       │
+│  └──────┬──────┘  └────────────────┘  └──────────┬───────────┘       │
 │         │                                        │                   │
 │         ┌────────────────────────────┐           │                   │
 │         │   Compilation Pipeline     │           │                   │
 │         │   (parallel throughout)    │           │                   │
 │         │                            │           │                   │
-│         │  ┌─────┐  ┌──────────┐    │           │                   │
-│         │  │Lexer│─▶│Preproc-  │    │           │                   │
-│         │  │     │  │essor     │    │           │                   │
-│         │  └─────┘  └────┬─────┘    │           │                   │
-│         │                │          │           │                   │
-│         │         ┌──────▼──────┐   │           │                   │
-│         │         │   Parser    │   │           │                   │
-│         │         └──────┬──────┘   │           │                   │
-│         │                │          │           │                   │
-│         │    ┌───────────▼────────┐ │           │                   │
-│         │    │  Sema (modular)    │ │  ┌──────┐ │                   │
-│         │    │ ┌──────┐┌───────┐ │ │  │Memo- │ │                   │
-│         │    │ │Lookup││Overld.│ │ │  │izer  │◀┘                   │
-│         │    │ ├──────┤├───────┤ │─┼─▶│      │                     │
-│         │    │ │Templ.││ Types │ │ │  └──────┘                     │
-│         │    │ ├──────┤├───────┤ │ │                               │
-│         │    │ │Layout││Mangle│ │ │                                │
-│         │    │ └──────┘└───────┘ │ │                                │
-│         │    └───────────┬───────┘ │                                │
-│         │                │         │                                │
-│         │         ┌──────▼──────┐  │                                │
-│         │         │  IR Lower   │  │                                │
-│         │         │  (ForgeIR)  │  │                                │
-│         │         └──────┬──────┘  │                                │
-│         │                │         │                                │
-│         │         ┌──────▼──────┐  │                                │
-│         │         │  x86-64     │  │                                │
-│         │         │  CodeGen    │  │                                │
-│         │         └──────┬──────┘  │                                │
-│         │                │         │                                │
-│         └────────────────┼─────────┘                                │
+│         │  ┌─────┐  ┌──────────┐     │           │                   │
+│         │  │Lexer│─▶│Preproc- │     │           │                   │
+│         │  │     │  │essor     │     │           │                   │
+│         │  └─────┘  └────┬─────┘     │           │                   │
+│         │                │           │           │                   │
+│         │         ┌──────▼──────┐    │           │                   │
+│         │         │   Parser    │    │           │                   │
+│         │         └──────┬──────┘    │           │                   │
+│         │                │           │           │                   │
+│         │    ┌───────────▼────────┐  │           │                   │
+│         │    │  Sema (modular)    │  │  ┌──────┐ │                   │
+│         │    │ ┌──────┐┌───────┐  │  │  │Memo- │ │                   │
+│         │    │ │Lookup││Overld.│  │  │  │izer  │◀┘                  │
+│         │    │ ├──────┤├───────┤  │──┼─▶│     │                     │
+│         │    │ │Templ.││ Types │  │  │  └──────┘                     │
+│         │    │ ├──────┤├───────┤  │  │                               │
+│         │    │ │Layout││Mangle │  │  │                               │
+│         │    │ └──────┘└───────┘  │  │                               │
+│         │    └───────────┬────────┘  │                               │
+│         │                │           │                               │
+│         │         ┌──────▼──────┐    │                               │
+│         │         │  IR Lower   │    │                               │
+│         │         │  (ForgeIR)  │    │                               │
+│         │         └──────┬──────┘    │                               │
+│         │                │           │                               │
+│         │         ┌──────▼──────┐    │                               │
+│         │         │  x86-64     │    │                               │
+│         │         │  CodeGen    │    │                               │
+│         │         └──────┬──────┘    │                               │
+│         │                │           │                               │
+│         └────────────────┼───────────┘                               │
 │                          │                                           │
-│              ┌───────────┼───────────┐                              │
-│              │           │           │                              │
-│       ┌──────▼──────┐ ┌─▼────────┐ ┌▼──────────┐                  │
-│       │   Linker    │ │ Runtime  │ │    DAP     │                  │
-│       │ (release    │ │ Loader / │ │  Debugger  │◀── VS Code      │
-│       │  mode only) │ │ JIT      │ │  Server    │                  │
-│       └─────────────┘ └──────────┘ └────────────┘                  │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+│              ┌───────────┼───────────┐                               │
+│              │           │           │                               │
+│       ┌──────▼──────┐ ┌─▼────────┐ ┌▼───────────┐                    │
+│       │   Linker    │ │ Runtime  │ │    DAP     │                    │
+│       │ (release    │ │ Loader / │ │  Debugger  │◀── VS Code        │
+│       │  mode only) │ │ JIT      │ │  Server    │                    │
+│       └─────────────┘ └──────────┘ └────────────┘                    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -536,7 +536,7 @@ own process, and capture the result.**
 > **Implementation dependency**: This approach requires the full compilation pipeline
 > (forge-ir → forge-codegen → JIT loader) to be operational. During Sema (Phase 3),
 > `consteval` contexts are detected and recorded as deferred evaluations. The actual
-> compilation and execution happens in **Phase 5a**, after the JIT infrastructure from
+> compilation and execution happens in **Phase 6**, after the JIT infrastructure from
 > Phase 5 is available. The generated native code is mapped into the daemon's own
 > address space and executed in-process to produce compile-time constants.
 
@@ -724,24 +724,24 @@ etc.) that inform this design.
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                 Target Process                   │
-│                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │
-│  │ main()   │  │ Foo::bar │  │ stub: Baz()  │  │
-│  │ compiled │  │ compiled │  │ → trap to    │  │
-│  │          │──│          │──│   daemon     │  │
-│  └──────────┘  └──────────┘  └──────┬───────┘  │
+│                 Target Process                  │
+│                                                 │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
+│  │ main()   │  │ Foo::bar │  │ stub: Baz()  │   │
+│  │ compiled │  │ compiled │  │ → trap to    │   │
+│  │          │──│          │──│   daemon     │   │
+│  └──────────┘  └──────────┘  └───────┬──────┘   │
 │                                      │          │
 └──────────────────────────────────────┼──────────┘
                                        │
                     ┌──────────────────▼──────────┐
-                    │        forgecc Daemon        │
-                    │                              │
-                    │  1. Compile Baz()            │
-                    │  2. Map into target process  │
-                    │  3. Patch stub → real code   │
-                    │  4. Resume execution         │
-                    └──────────────────────────────┘
+                    │        forgecc Daemon       │
+                    │                             │
+                    │  1. Compile Baz()           │
+                    │  2. Map into target process │
+                    │  3. Patch stub → real code  │
+                    │  4. Resume execution        │
+                    └─────────────────────────────┘
 ```
 
 **Relationship to UE5's Live Coding**: UE5 already has Live Coding (via Live++) which
@@ -1098,12 +1098,12 @@ separate IPC mechanism to maintain.
 ```
 UBT / ninja ──── 1 HTTP/2 connection ────▶ local daemon (:9473)
                  (hundreds of concurrent       │
-                  compile streams)              │
-                                                ├── 1 HTTP/2 connection ──▶ peer A (:9473)
-                                                │   (concurrent artifact   
-                                                │    get/put streams)      
-                                                │
-                                                └── 1 HTTP/2 connection ──▶ peer B (:9473)
+                  compile streams)             │
+                                               ├── 1 HTTP/2 connection ──▶ peer A (:9473)
+                                               │   (concurrent artifact   
+                                               │    get/put streams)      
+                                               │
+                                               └── 1 HTTP/2 connection ──▶ peer B (:9473)
 ```
 
 **Wire format: MessagePack (default) + JSON (debug)**
@@ -1400,7 +1400,7 @@ Machine A                              Machine B
 │ Daemon A │◄── DHT sync (TCP) ─────▶│ Daemon B │
 │          │                          │          │
 │ Store:   │                          │ Store:   │
-│ has X123 │◄── get(X123) ──────────│ needs    │
+│ has X123 │◄── get(X123) ────────────│ needs    │
 │          │─── bytes ──────────────▶│ X123     │
 └──────────┘                          └──────────┘
 ```
@@ -1482,30 +1482,38 @@ definitions = ["UE_BUILD_DEVELOPMENT=1", "WITH_EDITOR=1"]
 > | Design-heavy but with good references | 1.5–2x faster | Parser, IR design, codegen lowering, linker |
 > | Subtle correctness / deep language semantics | 1–1.5x faster | Sema (templates, overload resolution, concepts), JIT patching, distributed consistency |
 >
-> **Adjusted total**: The ~91 manual weeks could realistically compress to
-> **~30–45 weeks** for one person working full-time with AI assistance. The largest
+> **Adjusted total**: The ~98 manual weeks could realistically compress to
+> **~33–49 weeks** for one person working full-time with AI assistance. The largest
 > gains come from the lexer/preprocessor, codegen, and linker phases; the smallest
 > from Sema and JIT runtime correctness work.
 
 ### Phase 0: Infrastructure (Weeks 1–4)
 - [ ] Cargo workspace setup
-- [ ] `forge-store`: Content-addressed local store on redb
+- [ ] `forge-store`: Content-addressed local store on redb, build index table
 - [ ] `forge-common`: Diagnostics, source map, string interning, hashing
-- [ ] `forge-daemon`: Basic daemon lifecycle, HTTP server (axum)
+- [ ] `forge-daemon`: Basic daemon lifecycle, HTTP server (axum), workspace binding
 - [ ] `forge-net`: Seed-based peer discovery, basic DHT
+- [ ] **CLI / HTTP compile interface**: `POST /v1/compile` and `POST /v1/link`
+  endpoints accepting compile/link actions — this is the primary way to feed work
+  into the daemon from day one (UBT integration comes later; during early phases,
+  a simple CLI wrapper or `curl` submits actions directly)
 - [ ] Determinism infrastructure: deterministic hasher, `--verify-determinism` mode
 
-**Milestone**: Daemon starts, peers discover each other, store get/put works locally
-and across network. All data structures use deterministic ordering.
+**Milestone**: Daemon starts, accepts compile actions via HTTP, peers discover each
+other, store get/put works locally and across network. All data structures use
+deterministic ordering.
 
 ### Phase 1: Frontend — Lexer & Preprocessor (Weeks 5–10)
 - [ ] `forge-lex`: Full C/C++20 lexer
 - [ ] `forge-pp`: Preprocessor with all required directives
 - [ ] Automatic header caching (replaces PCH)
 - [ ] Memoization of preprocessed output in the store
+- [ ] Basic Windows SDK header compatibility (start testing against `<windows.h>`
+  and common system headers — these are needed by every target level)
 
 **Milestone**: Can preprocess UE5 header files correctly. Headers are automatically
-cached. No PCH configuration needed.
+cached. No PCH configuration needed. Target level I (hand-crafted tests) preprocesses
+correctly.
 
 ### Phase 2: Parser (Weeks 11–18)
 - [ ] `forge-parse`: Recursive descent parser for C and C++20
@@ -1513,7 +1521,8 @@ cached. No PCH configuration needed.
 - [ ] Concepts/requires-clause parsing
 - [ ] Error recovery
 
-**Milestone**: Can parse UE5/Game source files into an AST.
+**Milestone**: Can parse UE5/Game source files into an AST. Target level I parses
+correctly.
 
 ### Phase 3: Semantic Analysis (Weeks 19–34)
 - [ ] `forge-sema`: Modular Sema (see §4.5 for structure)
@@ -1526,9 +1535,11 @@ cached. No PCH configuration needed.
 - [ ] `consteval` context detection — Sema records deferred `consteval` calls for
   later JIT evaluation (requires IR + codegen + JIT from Phases 4–5; see §4.6a)
 - [ ] SEH support (`__try/__except/__finally`)
+- [ ] MSVC STL header compatibility (progressively — needed for levels IV–VI;
+  link against vcruntime.lib, ucrt.lib)
 
 **Milestone**: Can type-check UE5/Game source files. No Sema file > 1000 lines.
-`consteval` contexts are detected and recorded; full evaluation deferred to Phase 5a.
+`consteval` contexts are detected and recorded; full evaluation deferred to Phase 6.
 
 ### Phase 4: IR & Code Generation (Weeks 35–46)
 - [ ] `forge-ir`: SSA-based IR with SIMD intrinsic support
@@ -1537,10 +1548,12 @@ cached. No PCH configuration needed.
 - [ ] SSE/AVX intrinsic lowering
 - [ ] COFF section generation
 - [ ] Debug metadata generation (source maps, type info, frame layouts — stored in
-  internal format for DAP; CodeView serialization deferred to Phase 6)
+  internal format for DAP; CodeView serialization deferred to Phase 8)
 - [ ] Basic `__asm` block support
+- [ ] **Target levels I–II**: stb libraries compile and produce correct output
 
-**Milestone**: Can compile simple C/C++ programs to working x86-64 code.
+**Milestone**: Can compile simple C/C++ programs to working x86-64 code. Levels I–II
+pass `forge-verify`.
 
 ### Phase 5: Runtime Loader / JIT (Weeks 47–54)
 - [ ] `forge-daemon/loader.rs`: Process creation, section mapping
@@ -1549,10 +1562,12 @@ cached. No PCH configuration needed.
 - [ ] Import library parsing (.lib) for Windows SDK / third-party DLLs
 - [ ] Static initializer ordering and execution
 - [ ] Exception handling registration (`RtlAddFunctionTable`)
+- [ ] **Target level III**: LMDB compiles, links, and runs via JIT
 
 **Milestone**: Can JIT-compile and run a simple C++ program. Changes are patched live.
+Target level III passes `forge-verify`.
 
-### Phase 5a: `consteval`/`constexpr` via JIT (Weeks 55–57)
+### Phase 6: `consteval`/`constexpr` via JIT (Weeks 55–57)
 - [ ] `forge-sema/consteval`: Wire deferred `consteval` calls to the JIT pipeline
 - [ ] Compile `consteval` functions to native code via forge-ir → forge-codegen
 - [ ] Map compiled code into daemon's address space (`VirtualAlloc` + `PAGE_EXECUTE`)
@@ -1560,11 +1575,13 @@ cached. No PCH configuration needed.
 - [ ] Lightweight sanitizer instrumentation (overflow, null deref, bounds checks)
 - [ ] Sandboxed allocator for `constexpr` `new`/`delete` (C++20)
 - [ ] Memoization of `consteval` results: `blake3(function_hash + args) → result`
+- [ ] **Target levels IV–VI**: nlohmann/json, Dear ImGui, Google Test
 
 **Milestone**: `consteval` functions compile and execute in-process. Results are
-cached and reused across TUs. No AST interpreter needed.
+cached and reused across TUs. No AST interpreter needed. Levels IV–VI pass
+`forge-verify`.
 
-### Phase 5b: DAP Debugger (Weeks 58–61)
+### Phase 7: DAP Debugger (Weeks 58–61)
 - [ ] `forge-debug`: DAP protocol server (JSON-over-stdio)
 - [ ] Breakpoint management (int3 patching)
 - [ ] Single-stepping (hardware debug registers)
@@ -1574,28 +1591,64 @@ cached and reused across TUs. No AST interpreter needed.
 
 **Milestone**: Can debug JIT-compiled programs from VS Code. No PDB needed.
 
-### Phase 6: Linker — Release Mode (Weeks 62–67)
+### Phase 8: Linker — Release Mode (Weeks 62–67)
 - [ ] `forge-link`: Symbol resolution, section layout
 - [ ] PE executable generation
 - [ ] DLL generation (for UE5 module structure)
 - [ ] Import library reading
 - [ ] Incremental linking
 - [ ] PDB generation (release mode only — deferred priority)
+- [ ] **Target level VII**: Selected LLVM lit tests pass
 
 **Milestone**: Can link multi-file C++ programs into working PE executables and DLLs.
+Target level VII provides regression coverage.
 
-### Phase 7: UE5/Game Compatibility (Weeks 68–83)
-- [ ] UBT integration (`ForgeccToolChain.cs`)
+### Phase 9: Real-Time Content Project (Weeks 68–71)
+- [ ] **Target level VIII**: Compile raylib + a small real-time demo
+- [ ] Multi-TU linking with D3D11/Win32 interop
+- [ ] JIT-compile and run the demo via the daemon
+- [ ] Test hot-patching: change a shader parameter or game logic function, see the
+  result in the running application within seconds
+- [ ] Fix issues found with DLL loading, SIMD, threads, game loop patterns
+
+**Milestone**: A real-time graphical application builds, runs, and hot-reloads via
+the daemon. This validates the full pipeline (compile → link → JIT → patch) on a
+real-world content project before tackling UE5.
+
+### Phase 10: forge-demo — Full-Feature Showcase (Weeks 72–74)
+- [ ] **Target level IX**: Write and compile **forge-demo** (~2–5k LoC C++20 app)
+- [ ] C++20 feature coverage: `concept`, `requires`, structured bindings, `if constexpr`,
+  `auto` return types, `consteval` lookup tables (sin/cos, color palettes)
+- [ ] SIMD math: SSE/AVX vector/matrix operations (`__m128`, `_mm_mul_ps`)
+- [ ] SEH: `__try/__except` around D3D calls
+- [ ] STL usage: `std::span`, `std::array`, `std::vector`, `<algorithm>`, `<ranges>`
+- [ ] DLL plugin: `plugin.dll` loaded at runtime — validates DLL generation and import
+- [ ] DAP debugging: set breakpoints in the running demo, inspect variables mid-frame
+- [ ] JIT hot-patching demo: change gravity/color/logic in `physics.cpp` or `scene.cpp`,
+  see the result in the running application within ~1 second
+- [ ] Distributed compilation: compile forge-demo across two machines via P2P
+
+**Milestone**: A single small project exercises every compiler phase. The hot-patching
+demo provides a compelling visual demonstration of **forgecc**'s value proposition.
+All C++20 features, SIMD, SEH, DLL linking, DAP, and distributed compilation work
+correctly on this project before moving to UE5.
+
+### Phase 11: UE5/Game Integration (Weeks 75–90)
+- [ ] UBT integration (`ForgeccToolChain.cs`) — replaces the CLI/curl workflow with
+  native UBT support; compile and link actions flow through UBT's action graph
 - [ ] Handle UE5-specific patterns (UHT-generated code, `*_API` DLL exports, etc.)
-- [ ] Windows SDK header compatibility
-- [ ] MSVC STL header compatibility (link against vcruntime.lib, ucrt.lib)
+- [ ] Remaining Windows SDK / MSVC STL edge cases found during UE5 builds
 - [ ] Deterministic compilation verification on UE5 codebase
-- [ ] Fix edge cases found while building Game
-- [ ] Build Game editor successfully
+- [ ] **Progressive UE5 testing** (target level X):
+  - [ ] Single UE5 module (e.g., Core) compiles successfully
+  - [ ] Small set of modules (Core + CoreUObject + Engine) compile and link
+  - [ ] UE5 Lyra demo builds and runs
+  - [ ] Full Game editor builds and runs
+- [ ] Fix edge cases found at each progressive stage
 
 **Milestone**: Game editor builds and runs via the daemon. Debugging works via DAP.
 
-### Phase 8: Distributed Features (Weeks 84–91)
+### Phase 12: Distributed Features (Weeks 91–98)
 - [ ] Full DHT implementation with replication
 - [ ] Cross-machine artifact sharing
 - [ ] Benchmark: two machines sharing compilation work
@@ -1608,27 +1661,74 @@ cached and reused across TUs. No AST interpreter needed.
 ### 8a. Incremental Target Codebases
 
 Rather than jumping from "Hello World" to UE5, **forgecc** is validated against a ladder
-of real-world open-source C/C++ projects of increasing complexity. Each level serves
-as a milestone gate: the compiler must produce correct, runnable output for level N
-before moving to level N+1.
+of real-world open-source C/C++ projects of increasing complexity. Each **target level**
+(numbered with Roman numerals I–X) serves as a milestone gate: the compiler must
+produce correct, runnable output for a given target level before moving to the next.
+(Target levels are distinct from implementation phases — phases describe *what we
+build*, target levels describe *what we validate against*.)
 
-| Level | Project | ~LoC | Why | Key features exercised |
+| Target Level | Project | ~LoC | Why | Key features exercised |
 |---|---|---|---|---|
-| 0 | Hand-crafted test suite | <1k | Controlled tests for each language feature | All, incrementally |
-| 1 | [**stb libraries**](https://github.com/nothings/stb) (stb_image.h, etc.) | ~7k per lib | Pure C, single-file, no dependencies, widely used | C99, macros, function pointers |
-| 2 | [**LMDB**](https://github.com/LMDB/lmdb) | ~12k | Pure C, real-world database, COFF/PE linking exercise | C99, Win32 API, threads |
-| 3 | [**nlohmann/json**](https://github.com/nlohmann/json) (single-header) | ~25k | Header-only C++11/17, heavy templates, tests memoization | Templates, SFINAE, exceptions, STL |
-| 4 | [**Dear ImGui**](https://github.com/ocornut/imgui) | ~70k | C++11, moderate complexity, Win32/DX backends, good for JIT testing | Classes, vtables, function pointers, Win32 |
-| 5 | [**Google Test**](https://github.com/google/googletest) | ~30k | C++14, templates, macros, used by many projects | Templates, macros, exceptions, RTTI |
-| 6 | [**LLVM lit test suite**](https://github.com/llvm/llvm-test-suite) (selected C/C++ tests) | varies | Known-good reference tests with expected outputs | Wide coverage |
-| 7 | **UE5 Lyra demo** / Game editor | ~millions | Full target | Everything |
+| I | Hand-crafted test suite | <1k | Controlled tests for each language feature | All, incrementally |
+| II | [**stb libraries**](https://github.com/nothings/stb) (stb_image.h, etc.) | ~7k per lib | Pure C, single-file, no dependencies, widely used | C99, macros, function pointers |
+| III | [**LMDB**](https://github.com/LMDB/lmdb) | ~12k | Pure C, real-world database, COFF/PE linking exercise | C99, Win32 API, threads |
+| IV | [**nlohmann/json**](https://github.com/nlohmann/json) (single-header) | ~25k | Header-only C++11/17, heavy templates, tests memoization | Templates, SFINAE, exceptions, STL |
+| V | [**Dear ImGui**](https://github.com/ocornut/imgui) | ~70k | C++11, moderate complexity, Win32/DX backends, good for JIT testing | Classes, vtables, function pointers, Win32 |
+| VI | [**Google Test**](https://github.com/google/googletest) | ~30k | C++14, templates, macros, used by many projects | Templates, macros, exceptions, RTTI |
+| VII | [**LLVM lit test suite**](https://github.com/llvm/llvm-test-suite) (selected C/C++ tests) | varies | Known-good reference tests with expected outputs | Wide coverage |
+| VIII | [**raylib**](https://github.com/raysan5/raylib) + small real-time demo | ~100k | Real-time rendering, game loop, Win32/D3D, multi-TU linking, hot-reload testing | D3D interop, DLL loading, game loop, SIMD, threads, JIT patching of running app |
+| IX | **forge-demo** (purpose-built C++20 showcase) | ~2–5k | Smallest project that exercises *every* phase; interactive real-time app designed for the "wow" demo | C++20 concepts, `consteval` tables, `std::span`/`std::array`, SIMD math, Win32/D3D11, SEH, DLL plugin, DAP debugging, hot-patching live |
+| X | **UE5 Lyra demo** / Game editor | ~millions | Full target | Everything |
 
-**How levels map to phases**:
-- Levels 0–1 are achievable after Phase 4 (codegen) — pure C, simple linking
-- Level 2 exercises the JIT loader (Phase 5) — threads, Win32 API
-- Levels 3–5 require full Sema (Phase 3) + consteval (Phase 5a) — heavy C++ templates
-- Level 6 provides regression coverage across all phases
-- Level 7 is the final target (Phase 7)
+**Target level IX — forge-demo**: No single small open-source project exercises all
+compiler phases, because real-world projects target broad compiler support and avoid
+bleeding-edge C++20 features. **forge-demo** is a purpose-built ~2–5k LoC interactive
+application (Win32 + D3D11) that intentionally uses every feature the compiler must
+handle — a compiler stress test disguised as a demo app. Suggested structure:
+
+```
+forge-demo/
+  main.cpp       — Win32 window creation, message loop, D3D11 init
+  renderer.cpp   — D3D11 rendering, shader loading, draw calls
+  scene.cpp      — Scene graph, entity system using C++20 concepts
+  math.cpp       — SIMD vector/matrix math (SSE/AVX), consteval lookup tables
+  physics.cpp    — Particle/physics sim (the "change this and see it live" target)
+  plugin.dll     — Optional DLL plugin to test DLL linking and loading
+```
+
+| Phase | Feature needed | How forge-demo exercises it |
+|---|---|---|
+| 1 | Preprocessor, Windows SDK headers | `#include <windows.h>`, `#include <d3d11.h>`, conditional compilation |
+| 2 | C++20 parser | `concept`, `requires`, structured bindings, `if constexpr`, `auto` return types |
+| 3 | Templates, concepts, `consteval`, STL, SEH | `concept Renderable`, `consteval` color/math tables, `std::span`/`std::array`, `__try/__except` around D3D calls |
+| 4 | x86-64 codegen, SIMD | `__m128`/`_mm_mul_ps` for transforms, hand-written SIMD math |
+| 5 | JIT, live patching, DLL imports | Entire app runs via JIT; changing `physics.cpp` patches the running app live |
+| 6 | `consteval` via JIT | `consteval` sin/cos tables, color palettes, vertex data |
+| 7 | DAP | Set breakpoints in the running demo, inspect variables mid-frame |
+| 8 | PE/DLL linking | Release build produces standalone `.exe` + `plugin.dll` |
+| 9 | Real-time + hot-reload | This *is* the real-time hot-reload demo |
+| 12 | Distributed | Compile forge-demo across two machines |
+
+The **demo scenario for JIT hot-patching**: the app is running and rendering a scene;
+the developer changes the gravity constant in `physics.cpp` or the particle color
+function in `scene.cpp`, and within a second the running application reflects the
+change — no restart, no visible recompile cycle. This is the "wow" moment that
+demonstrates **forgecc**'s value proposition.
+
+**How target levels map to implementation phases** (each target level is an explicit
+milestone gate within its phase):
+- **Target levels I–II** gate Phase 4 (codegen) — pure C, simple linking
+- **Target level III** gates Phase 5 (JIT loader) — threads, Win32 API
+- **Target levels IV–VI** gate Phase 6 (consteval) — heavy C++ templates, STL headers
+- **Target level VII** gates Phase 8 (release linker) — regression coverage
+- **Target level VIII** bridges Phase 8 → Phase 10 — real-time rendering, game loop,
+  D3D interop, multi-TU linking, and the first real test of JIT hot-patching a running
+  graphical application
+- **Target level IX** gates Phase 11 — the only project that exercises *every* phase
+  (C++20 concepts, `consteval`, SIMD, SEH, DLL plugin, DAP debugging, hot-patching);
+  serves as the comprehensive validation gate before UE5
+- **Target level X** is progressive within Phase 11: single UE5 module → small set →
+  Lyra → full Game editor
 
 ### 8b. Verification Tooling: `forge-verify`
 
@@ -1931,7 +2031,6 @@ store naturally handles BMI caching.
 
 ### 15.8 UBT Compiler Invocation
 - `VCToolChain.cs` (~3,979 lines) handles both MSVC and clang-cl modes
-- Game already uses clang-cl (multiple `HVN_START(CLOUD-1590, Enable clang-cl for Game)` markers)
 - `VCCompileAction.cs` structures compilation as action objects with all necessary metadata
 - **Clang-cl mode is the better integration point** for **forgecc**
 
@@ -2150,7 +2249,7 @@ Developer PC                              Console Devkit (dev mode)
 │   forgecc daemon     │                  │   forgecc-client     │
 │                      │  HTTP+msgpack    │   (thin agent)       │
 │  - Cross-compiles    │◄───────────────▶│                      │
-│    to console arch   │  (same unified  │  - Receives sections │
+│    to console arch   │  (same unified   │  - Receives sections │
 │  - Content store     │   protocol §4.13)│  - Maps into process │
 │  - Sema, IR, codegen │                  │  - Patches functions │
 │  - DAP server        │                  │  - Debug primitives  │
@@ -2253,7 +2352,7 @@ formats:
 
 **Executable generation** (`.exe` / `.dll` / console executables):
 
-- `forge-link` (Phase 6) handles PE/DLL generation for Windows
+- `forge-link` (Phase 8) handles PE/DLL generation for Windows
 - Console targets would need additional linker output formats (ELF for PS5/Switch,
   XEX-like for Xbox)
 - PDB generation (Windows) and DWARF emission (console/Linux) are only needed here
@@ -2288,5 +2387,5 @@ The proof-of-concept is successful if:
 9. ✅ Debugging works via DAP in VS Code (breakpoints, stepping, variable inspection)
 10. ✅ Compilation is fully deterministic (`--verify-determinism` passes)
 11. ✅ The application only runs through the daemon — no standalone .EXE needed for dev
-12. ✅ All incremental target codebases (§8a) levels 0–5 pass `forge-verify` (§8b)
+12. ✅ All incremental target codebases (§8a) levels I–VI pass `forge-verify` (§8b)
 13. ✅ `consteval` functions execute via in-process JIT, not an AST interpreter

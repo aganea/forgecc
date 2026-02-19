@@ -145,7 +145,7 @@ debugging, and distributed caching into a single daemon process**.
 │         │   (parallel throughout)    │           │                   │
 │         │                            │           │                   │
 │         │  ┌─────┐  ┌──────────┐     │           │                   │
-│         │  │Lexer│─▶│Preproc- │     │           │                   │
+│         │  │Lexer│─>│Preproc-  │     │           │                   │
 │         │  │     │  │essor     │     │           │                   │
 │         │  └─────┘  └────┬─────┘     │           │                   │
 │         │                │           │           │                   │
@@ -156,8 +156,8 @@ debugging, and distributed caching into a single daemon process**.
 │         │    ┌───────────▼────────┐  │           │                   │
 │         │    │  Sema (modular)    │  │  ┌──────┐ │                   │
 │         │    │ ┌──────┐┌───────┐  │  │  │Memo- │ │                   │
-│         │    │ │Lookup││Overld.│  │  │  │izer  │◀┘                  │
-│         │    │ ├──────┤├───────┤  │──┼─▶│     │                     │
+│         │    │ │Lookup││Overld.│  │  │  │izer  │<┘                   │
+│         │    │ ├──────┤├───────┤  │──┼─>│      │                     │
 │         │    │ │Templ.││ Types │  │  │  └──────┘                     │
 │         │    │ ├──────┤├───────┤  │  │                               │
 │         │    │ │Layout││Mangle │  │  │                               │
@@ -180,7 +180,7 @@ debugging, and distributed caching into a single daemon process**.
 │              │           │           │                               │
 │       ┌──────▼──────┐ ┌─▼────────┐ ┌▼───────────┐                    │
 │       │   Linker    │ │ Runtime  │ │    DAP     │                    │
-│       │ (release    │ │ Loader / │ │  Debugger  │◀── VS Code        │
+│       │ (release    │ │ Loader / │ │  Debugger  │<── VS Code         │
 │       │  mode only) │ │ JIT      │ │  Server    │                    │
 │       └─────────────┘ └──────────┘ └────────────┘                    │
 │                                                                      │
@@ -1428,6 +1428,71 @@ Rust's ownership model naturally encourages this pattern. `Arc<AstNode>` provide
 shared immutable access, and the borrow checker prevents accidental mutation. Where
 Sema needs to "modify" a node (e.g., adding type annotations), it creates a new node
 that references the original, forming a layered structure.
+
+### 6.6 Team and CI: Weekly Aggregate Savings
+
+A central insight behind **forgecc** is that **full invalidation of the build is rare**.
+On a shared branch, most commits touch a small number of files. Clean rebuilds or
+cache wipes are the exception. So the **daily** reality is: each developer and each
+build machine only needs to compile a **delta** — the TUs that actually changed or
+that depend on changed code. With fine-grained dependency signatures (§4.2), that
+delta is minimal. With a **shared content-addressed store** over P2P (§4.12), each
+unique (TU, input context) is compiled **once** across the entire team and CI; every
+other daemon fetches the artifact by hash.
+
+**Implication for weekly savings:** The benefit is not only "one full rebuild is 2×
+faster" but "**across the whole team and all build machines, we compile much less
+in total**." Aggregate compilation work in a week can drop by a large factor because
+work is shared instead of repeated.
+
+**Illustrative model (UE-style team):**
+
+| Role | Count | Builds per day | Today: TUs recompiled per build (approx.) | Today: TU-minutes per build (approx.) |
+|------|-------|----------------|------------------------------------------|---------------------------------------|
+| Developer | 20 | 20 | 50–200 | 25–200 |
+| Build machine (CI) | 5 | 50 | 100–500 | 50–300 |
+
+- **Without forgecc:** Each developer does ~20 × 100 ≈ 2,000 TU-minutes/day; 20 devs
+  → 40,000 TU-minutes/day. CI: 5 × 50 × 150 ≈ 37,500 TU-minutes/day. **Total ~77,500
+  TU-minutes/day** → **~388k TU-minutes/week** (single-threaded equivalent).
+- **With forgecc (P2P + fine-grained incremental):** Many of those "TUs" are the
+  **same** (same file, same flags, same header state). The first daemon to need a
+  (TU, context) compiles it; all others get a cache hit from the P2P store. If
+  **20%** of the week's logical compilations are unique and **80%** are served from
+  peers, total **actual** compilation is 20% of 388k ≈ **78k TU-minutes/week**.
+- **Result:** Roughly **5× less aggregate compilation work** in the week. The exact
+  factor depends on how aligned the team's changes are (same branch, similar -D
+  flags, similar includes). Conservative estimates still yield **3–5×** reduction in
+  total CPU-time spent compiling across the org.
+
+**Takeaways:**
+
+- **Weekly savings** are in **aggregate**: fewer CPU-hours compiling, faster feedback
+  for everyone (incremental + cache hits from peers), and less load on build machines.
+- **First build of the week** (or after a big merge) does more work; **subsequent
+  builds** are mostly cache hits from peers. The system naturally favors the common
+  case: small deltas, shared codebase.
+
+### 6.7 Distribution and Caching Out of the Box
+
+Today, getting **distribution + caching** for C++ builds requires assembling and
+operating several pieces: a cache (sccache, ccache, Reclient, BuildBuddy), a
+distributed build layer (Incredibuild, FASTBuild, Reclient), cache servers or
+cluster endpoints, auth, and tuning. **forgecc** provides equivalent behavior
+**out of the box** with no separate servers and no .obj shipping.
+
+| Concern | Today | With forgecc |
+|---------|--------|----------------|
+| **Cache** | sccache / ccache / Reclient, separate from the compiler | Daemon **is** the cache; content-addressed store is built in (§4.1, §4.2). |
+| **Distribution** | Incredibuild, FASTBuild, Reclient, distcc, etc. | P2P between daemons (§4.12); no central job scheduler. |
+| **What is shared** | Whole .obj (or equivalent) per TU | Content-addressed **sections**; same hash ⇒ one logical copy across the network. |
+| **Warm cache** | Dev A's cache ≠ Dev B's; CI cache often separate. | Same codebase + same inputs ⇒ same hashes ⇒ any peer can serve. |
+| **Setup** | Servers, auth, config, cache sizing, invalidation. | Run the daemon; point at seeds (or same LAN). No dedicated cache servers. |
+| **Network load** | 15–18 GB (e.g. UE Editor) of .obj in/out on cache miss or distribute. | Fetch only **missing** content by hash; heavy dedup (header-derived code shared). |
+
+**Value proposition:** Teams get **shared caching and distribution** by running
+**forgecc** daemons and connecting them (e.g. via seeds). No separate distribution
+or cache infrastructure to deploy or maintain.
 
 ---
 

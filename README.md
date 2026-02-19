@@ -31,7 +31,7 @@ It is informed by LLVM/Clang's architecture but is a clean implementation, not a
 ```
   Build system (UBT / Ninja)          VS Code (DAP)          Peer daemons
               │                            │                       │
-              └────────── HTTP/2 (msgpack/json) ──────────────────┘
+              └────────── HTTP/2 (msgpack/json) ───────────────────┘
                                     │
                             forgecc daemon
                     ┌───────────────┼───────────────┐

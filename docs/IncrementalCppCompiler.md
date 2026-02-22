@@ -53,8 +53,8 @@
 
 ## 1. Executive Summary
 
-**forgecc** is a thought experiment exploring what a C++ compiler could look like if
-designed from scratch around memoization, daemon persistence, and JIT execution. It
+**forgecc** is an architecture proposal for a C++ compiler designed from scratch
+around memoization, daemon persistence, and JIT execution. It
 takes the form of an incremental C++20 compiler and linker, written in Rust, running
 as a persistent daemon. Its primary goal is to dramatically reduce build times for
 large C++ codebases (target: Unreal Engine 5+ / Chromium) by:
@@ -123,19 +123,15 @@ debugging, and distributed caching into a single daemon process**.
   in the daemon (see §7.3)
 - No Objective-C/OpenCL/CUDA
 - No cross-compilation
-- No LLVM IR for the PoC — we define our own IR for determinism and memoization
+- No LLVM IR for the PoC — forgecc defines its own IR for determinism and memoization
   control; LLVM IR lowering deferred to release-mode optimization path (see §4.6b)
 - No PCH — the memoization/caching system replaces PCH transparently
-- No C++20 modules (UE5 has zero usage; see §15.14)
-- No C++20 coroutines (UE5 has zero usage in Engine; see §15.14)
-- No `std::ranges` / `std::views` (UE5 has zero usage; uses custom iterators)
-- No `std::format` (UE5 has zero usage; uses `FString::Printf` / `fmt`)
-- No `std::span` (UE5 has zero usage; uses `TArrayView` / `FMemoryView`)
-- No `__fastcall` / `__vectorcall` / `__thiscall` calling conventions (zero usage)
-- No `__declspec(novtable)` / `__declspec(property)` (zero usage)
-- No WinRT / WRL support (zero usage)
-- No resource compiler (.rc) support — `forge-rc.exe` exists as a driver shim but
-  forwards to `llvm-rc` or `rc.exe` for now; native .rc compilation is deferred
+- No C++20 modules for the PoC (see §14 and §15.14)
+- No C++20 coroutines for the PoC (see §15.14)
+- Selective language/library/extension scope: low-usage features outside the UE5 target
+  subset are deferred (details in §15.14 and §21.2)
+- Resource compilation is supported natively in the PoC via `forge-rc.exe` and
+  `/v1/rc` (MSVC/LLVM-compatible command-line surface)
 - No HLSL shader compilation — shaders are compiled by UE5's ShaderCompileWorker,
   a completely separate pipeline outside forgecc's scope
 - No memory budget optimization — this is a PoC; memory profiling and optimization
@@ -145,16 +141,15 @@ debugging, and distributed caching into a single daemon process**.
 
 ## 2. Design Principles
 
-1. **Minimal code, maximum leverage**: Every component should be as small as possible.
-   Prefer simplicity over generality. We don't need to handle every edge case in the
-   C++ standard — we need to handle the subset that UE5/Game uses.
+1. **Minimal code, maximum leverage**: Every component is as small as possible.
+   Prefer simplicity over generality. forgecc does not target every edge case in the
+   C++ standard — it targets the subset that UE5/Game uses.
 
 2. **Content-addressed everything**: Every intermediate artifact (tokens, AST nodes,
    types, IR, machine code sections) is identified by a hash of its inputs. If the
-   inputs haven't changed, the output is reused. The indexing model draws inspiration
-   from the [Legion Labs Merkle tree content store](https://github.com/legion-labs/legion/tree/main)
-   (`lgn-content-store`), which uses copy-on-write trees, structural diffing, and
-   layered indexers for efficient deduplication and change detection.
+   inputs haven't changed, the output is reused. The indexing model uses Merkle-style
+   content trees with copy-on-write updates, structural diffing, and layered indexers
+   for efficient deduplication and change detection.
 
 3. **No files, only database records**: Traditional compilers produce .obj files that
    the linker reads. **forgecc** skips this — the compiler writes sections directly into a
@@ -162,13 +157,13 @@ debugging, and distributed caching into a single daemon process**.
    No serialization/deserialization of object files.
 
 4. **Always-on, always-warm**: The daemon keeps hot data in memory. A full rebuild after
-   a single-line change should take milliseconds, not seconds.
+   a single-line change takes milliseconds, not seconds.
 
 5. **Distributed by default (IPFS-style)**: Multiple daemon instances form a peer-to-peer
    network. Storage is distributed across machines. No central server, no centralized
    storage. Machines discover each other via seeds.
 
-6. **No user-managed complexity**: Users should not need to manage PCH, unity builds,
+6. **No user-managed complexity**: Users do not manage PCH, unity builds,
    include-what-you-use, or module maps. The compiler handles caching, deduplication,
    and incremental compilation transparently.
 
@@ -186,11 +181,11 @@ debugging, and distributed caching into a single daemon process**.
 
 The natural first question is: why not build forgecc's features on top of
 LLVM/Clang? Clang is an excellent, mature C++ compiler — arguably the best open-
-source C++ front-end ever built. We have deep respect for the LLVM community and
-the decades of work that went into it. Ideally, we would contribute these ideas
-directly to LLVM. This section explains why, regrettably, the specific combination
+source C++ front-end ever built. This document respects the LLVM community and
+the decades of work that went into it. This project contributes ideas upstream where
+alignment exists. This section explains why, regrettably, the specific combination
 of features forgecc needs does not fit within LLVM/Clang's current architecture
-without changes so deep that they would amount to a rewrite of core subsystems.
+without changes so deep that they amount to a rewrite of core subsystems.
 
 **Prior art: projects that extended LLVM/Clang**
 
@@ -214,12 +209,12 @@ them as patches or forks becomes the dominant engineering cost.
 
 1. **Content-addressed memoization at every stage** — This is the core challenge.
    Clang's AST nodes are allocated in a `BumpPtrAllocator` with pointer identity;
-   they are not content-hashable by design. To add content-addressing, we would
-   need to either (a) serialize every AST node to compute a hash (which adds
-   overhead that could negate the memoization benefit) or (b) rework Clang's AST
-   allocation model to support structural hashing. Option (b) would touch a very
-   large number of files across `clang/AST/` and `clang/Sema/`. We would love to
-   see content-addressable AST nodes in Clang someday, but the scope of that
+   they are not content-hashable by design. To add content-addressing, forgecc
+   needs either (a) serialization of every AST node to compute a hash (which adds
+   overhead that can negate the memoization benefit) or (b) rework of Clang's AST
+   allocation model to support structural hashing. Option (b) touches a very
+   large number of files across `clang/AST/` and `clang/Sema/`. Content-addressable
+   AST nodes in Clang are valuable, but the scope of that
    change is beyond what a single project can reasonably propose.
 
 2. **Daemon mode with persistent state** — Clang's `CompilerInstance` is designed
@@ -246,11 +241,11 @@ them as patches or forks becomes the dominant engineering cost.
    sources of non-determinism described in §4.6b (sequential metadata IDs,
    emission-order-dependent value numbering). These are not bugs — they are
    consequences of LLVM IR's design, which optimizes for compilation speed rather
-   than output reproducibility. Fixing this would require canonicalization passes
+   than output reproducibility. Fixing this requires canonicalization passes
    in `llvm/lib/IR/` and `llvm/lib/Bitcode/`, touching ~50+ files. Some of these
-   changes might be upstreamable (deterministic output is valuable for build
-   reproducibility in general), and we would be happy to contribute them if the
-   LLVM community is interested.
+   changes are upstreamable candidates (deterministic output is valuable for build
+   reproducibility in general), and this project contributes them when community
+   alignment exists.
 
 5. **JIT execution with runtime patching** — This is where LLVM is closest to
    forgecc's vision. ORC JIT already provides impressive infrastructure:
@@ -261,16 +256,16 @@ them as patches or forks becomes the dominant engineering cost.
    TLS (ORC currently uses emulated TLS), build-system daemon integration, and
    — most importantly — content-addressed memoization. The JIT in forgecc is
    tightly coupled to the memoization system: every JIT'd function must be
-   content-addressed, cached, and distributable. Integrating this into ORC would
-   require either feeding it pre-built .obj files (reducing ORC to just a linker)
-   or modifying ORC's internals to work with our store. Instead, forgecc builds
+   content-addressed, cached, and distributable. Integrating this into ORC requires
+   either feeding it pre-built .obj files (reducing ORC to just a linker)
+   or modifying ORC's internals to work with the forgecc store. Instead, forgecc builds
    a simpler, purpose-built runtime loader (~3,000 lines) that consumes sections
    directly from the content-addressed store, using ORC as a reference
    implementation for the hard parts (relocation application, SEH registration,
    TLS setup).
 
 6. **Distributed P2P caching** — This is entirely new functionality that does not
-   exist in LLVM. It would be a pure addition, but it needs deep integration with
+   exist in LLVM. It is a pure addition, but it needs deep integration with
    the content-addressed store (point 1), which itself requires the architectural
    changes described above.
 
@@ -287,20 +282,20 @@ them as patches or forks becomes the dominant engineering cost.
 | **Total** | ~1,000+ files modified in a ~3M LoC codebase | |
 
 **The fork maintenance challenge**: LLVM/Clang receives ~1,000 commits per week.
-A fork touching 1,000+ files would diverge from upstream within months, making it
+A fork touching 1,000+ files diverges from upstream within months, making it
 increasingly difficult to pull in bug fixes, new platform support, and C++ standard
 updates. Zapcc's experience illustrates this — it was a well-executed fork by an
 experienced team, and it still became impractical to maintain.
 
-**The upstreaming challenge**: We would genuinely prefer to contribute these
+**The upstreaming challenge**: This project prefers to contribute these
 features to LLVM. However, the changes forgecc needs are architectural (AST
 allocation model, Sema threading, IR determinism), not incremental. Proposing
-changes of this scope to Clang's core data structures would be a multi-year effort
-requiring broad community consensus — and rightly so, since these changes would
+changes of this scope to Clang's core data structures is a multi-year effort
+requiring broad community consensus — and rightly so, since these changes
 affect every Clang user. The CaaS project's experience is informative: even with
 CERN's backing and a relatively modest patch set (~62 files), upstreaming
 incremental compilation support has been a years-long effort. forgecc's changes
-would be an order of magnitude larger.
+are an order of magnitude larger.
 
 **What forgecc gains from a fresh start**:
 
@@ -313,7 +308,7 @@ would be an order of magnitude larger.
 | **No upstream dependency** | No version tracking, no merge conflicts, no waiting for upstream reviews. |
 | **Subset targeting** | Only implement the C++ features UE5 actually uses. Clang must support everything — a much harder problem. |
 
-**What forgecc gives up — and how we mitigate it**:
+**forgecc trade-offs and mitigations**:
 
 | Cost | Mitigation |
 |---|---|
@@ -323,14 +318,13 @@ would be an order of magnitude larger.
 | **Community and ecosystem** | Clang has hundreds of contributors, sanitizers, static analyzers, clang-tidy, clang-format. forgecc starts without these, but the content-addressed store and daemon architecture enable new tooling patterns. |
 | **Standard compliance** | forgecc implements the C++ subset that UE5 uses, see §21. |
 
-**A hybrid path could preserve the relationship with LLVM**: The design envisions
-a possible `ForgeIR → LLVM IR` lowering path for release builds (§4.6b). If
-pursued, forgecc would not replace LLVM but rather use it as a backend for
+**A hybrid path preserves the relationship with LLVM**: The design includes
+`ForgeIR → LLVM IR` lowering for release builds (§4.6b). On this path, forgecc
+does not replace LLVM and instead uses it as a backend for
 optimized builds — similar to how Swift (SIL → LLVM IR) and Rust (MIR → LLVM IR)
-leverage LLVM today. In that scenario, the clean break would only be in the
+leverage LLVM today. In that scenario, the clean break is only in the
 front-end and the development-mode pipeline; improvements to LLVM's codegen or
-optimization passes would benefit forgecc's release builds automatically. Whether
-and when this path is implemented depends on how the project evolves.
+optimization passes benefit forgecc's release builds automatically.
 
 ---
 
@@ -429,7 +423,7 @@ Value: the artifact (tokens, AST fragment, IR, machine code section, etc.)
 - Data is fetched on demand from the peer that has it (content-addressed, so any peer
   with the same key has the same data)
 - **Seeds**: Daemons bootstrap into the network via a seed list (IP:port pairs).
-  No mDNS, no central discovery server. Seeds can be configured in a config file
+  No mDNS, no central discovery server. Seeds are configured in a config file
   or environment variable.
 - **No centralized storage**: Each machine stores what it compiles. Popular artifacts
   (e.g., frequently-included headers) naturally replicate across machines as they're
@@ -514,7 +508,7 @@ more stable.
 
 #### Fine-Grained Dependency Tracking
 
-This is one of the most impactful optimizations **forgecc** can implement, and it is
+This is one of the most impactful optimizations **forgecc** implements, and it is
 something no mainstream C++ compiler does today. The idea: after the first parse of a
 file, record a **dependency signature** — the minimal set of external inputs that
 actually affected the compilation result. On subsequent builds, check only those
@@ -557,7 +551,7 @@ signature has changed. If none have, skip the file entirely — not even re-lexi
 needed. This is strictly more precise than the TU-level hash (which re-hashes all
 includes and flags).
 
-**Expected impact**: For a typical "change one .cpp file" scenario in UE5, this could
+**Expected impact**: For a typical "change one .cpp file" scenario in UE5, this
 reduce the set of TUs that need any work from hundreds (due to shared headers) to just
 the one file that changed. For header changes, it narrows recompilation to only TUs
 that actually use the changed declarations — not all TUs that transitively include
@@ -584,7 +578,7 @@ means either **incorrect caching** (returning stale results after a change) or
 UE5's template-heavy code (TArray, TMap, TSet, TSharedPtr, TFunction, TDelegate,
 TVariant, TOptional, plus MSVC STL headers) means the same templates are instantiated
 across hundreds of TUs with the same or similar arguments. A single `TArray<AActor*>`
-instantiation produces ~2,000–5,000 lines of IR. If we can memoize it, we avoid
+instantiation produces ~2,000–5,000 lines of IR. Memoizing it avoids
 repeating that work across every TU that uses it. The potential savings are enormous —
 but only if the signature check is fast enough.
 
@@ -689,7 +683,7 @@ Every call expression involving dependent types produces an overload resolution:
 
 ##### Memoization strategy: phased approach
 
-Given the complexity above, we use a **three-tier strategy** that respects the
+Given the complexity above, forgecc uses a **three-tier strategy** that respects the
 fundamental memoization invariant (signature cost << computation cost):
 
 **Tier 1 — Structural key (Phase 3, day one)**
@@ -716,8 +710,8 @@ requires enumerating all declarations in the associated namespaces. However:
 
 - Associated namespaces are typically small (1–3 namespaces for most UE5 types)
 - The declarations in those namespaces are already parsed and hashed (from header
-  caching) — we're combining existing hashes, not re-parsing
-- We can cache the "namespace content hash" per namespace and invalidate it only
+  caching) — forgecc combines existing hashes, not re-parsing
+- forgecc caches the "namespace content hash" per namespace and invalidates it only
   when a declaration is added/removed/changed in that namespace
 
 **Estimated signature cost**: ~1–5 μs per instantiation (hash lookups + combine).
@@ -790,7 +784,7 @@ invalidations than Tier 1.
 
 **Key insight**: The Tier 2 signature is only computed once (during the first
 instantiation) and then stored alongside the cached result. On subsequent builds,
-we only *validate* it (check if any recorded dependency changed), which is much
+forgecc only *validates* it (check if any recorded dependency changed), which is much
 cheaper than computing it from scratch. This is analogous to how build systems
 record file dependencies during compilation and check mtimes on rebuild — the
 recording happens as a side effect of the work, not as a separate pass.
@@ -798,7 +792,7 @@ recording happens as a side effect of the work, not as a separate pass.
 **Tier 3 — Namespace content hash caching (cross-cutting optimization)**
 
 The most expensive part of Tier 1's `instantiation_context_hash` is enumerating
-associated namespaces. We optimize this with a **per-namespace content hash** that
+associated namespaces. forgecc uses a **per-namespace content hash** that
 is maintained incrementally:
 
 ```rust
@@ -843,22 +837,22 @@ declarations in `namespace game`. Adding `serialize` changes the hash.
 
 **Tier 2 handles this precisely** because `adl_results` records that the call to
 `serialize(x)` resolved to a specific candidate — or to *nothing* (a **negative
-dependency**). On rebuild, we check whether the same unqualified lookup with the same
+dependency**). On rebuild, forgecc checks whether the same unqualified lookup with the same
 argument types still produces the same winner. If the original lookup found no
 candidate and a new overload now exists, the sentinel `EMPTY_HASH` no longer matches,
 and the instantiation is invalidated. This "negative cache invalidation" is what makes
-the system sound in the presence of ADL: we track not just what *was* found, but also
+the system sound in the presence of ADL: forgecc tracks not just what *was* found, but also
 what *was not* found.
 
 **Worst case for ADL**: Types in the global namespace. The global namespace can
 contain thousands of declarations, making the namespace content hash expensive to
-compute. Mitigation: for the global namespace specifically, we partition the content
+compute. Mitigation: for the global namespace specifically, forgecc partitions the content
 hash by declaration name prefix or use a Merkle tree structure so that adding one
 function only invalidates the relevant subtree.
 
 ##### Signature cost budget
 
-To maintain the memoization invariant, we enforce these cost budgets:
+To maintain the memoization invariant, forgecc enforces these cost budgets:
 
 | Granularity | Max signature cost | Typical computation cost | Min ratio |
 |---|---|---|---|
@@ -868,7 +862,7 @@ To maintain the memoization invariant, we enforce these cost budgets:
 | Template instantiation (Tier 1) | ~1–5 μs (combine existing hashes) | ~50–500 μs (full instantiation) | 50x |
 | Template instantiation (Tier 2) | ~5–20 μs (validate recorded deps) | ~50–500 μs (full instantiation) | 5x |
 
-If profiling shows a granularity level violating its ratio, we either (a) make the
+If profiling shows a granularity level violating its ratio, forgecc either (a) makes the
 signature cheaper (coarser hash, fewer deps checked), or (b) drop to a coarser
 granularity level for that case. The system must **never** spend more time checking
 the cache than it would spend just doing the work.
@@ -914,7 +908,7 @@ runs until a root query is requested.
 |---|---|---|
 | **Execution model** | Push: pipeline runs stages in fixed order | Pull: queries execute on demand, top-down |
 | **Dependency tracking** | Explicit: each stage declares its input hash upfront | Implicit: salsa records dependencies during execution |
-| **Granularity control** | Manual: we choose granularity levels (TU, header, function, template) | Automatic: every tracked function is a memoization point |
+| **Granularity control** | Manual: granularity levels are chosen explicitly (TU, header, function, template) | Automatic: every tracked function is a memoization point |
 | **Cache key** | Content hash of inputs (blake3) | Revision counter + dependency graph walk |
 | **Invalidation** | Content-based: if the hash matches, the result is valid regardless of history | Revision-based: if any transitive input's revision changed, re-verify |
 | **Determinism** | Guaranteed: same inputs → same hash → same result, always | Guaranteed within a session; cross-session requires careful input identity |
@@ -934,7 +928,7 @@ runs until a root query is requested.
    if machine A computes `blake3(inputs) → result`, machine B can use that result
    without knowing anything about machine A's revision history. salsa's revision
    numbers are local to a single database instance. Making salsa distributed would
-   require mapping local revisions to content hashes anyway, at which point we've
+   require mapping local revisions to content hashes anyway, at which point the system has
    rebuilt forward memoization on top of salsa.
 
 2. **Persistence is free.** The content-addressed store is inherently persistent —
@@ -1064,7 +1058,7 @@ on tokens, and macro expansion can produce new tokens.
 - Clang-cl-specific: `__clang__`, `__clang_major__`, `__clang_minor__`
 
 **C language support**: The preprocessor and lexer must handle both C and C++ modes.
-Based on our analysis, UE5's Engine/Source/ThirdParty contains **4,335 .c files**
+Based on the codebase analysis, UE5's Engine/Source/ThirdParty contains **4,335 .c files**
 (libcurl, zlib, FreeType, Bink Audio, Rad Audio, etc.). These are third-party libraries
 that must compile as C.
 
@@ -1367,9 +1361,9 @@ constexpr int x = factorial(10);  // needs compile-time evaluation
 1. **Massively reduces Sema complexity**: No need for a ~17,000-line AST interpreter.
    The consteval module becomes ~800 lines of "compile and call" orchestration instead.
 
-2. **Lower semantic duplication (not "correctness for free")**: Reusing the normal
+2. **Lower semantic duplication**: Reusing the normal
    lowering/codegen path reduces "two implementations of semantics" risk, but it does
-   not eliminate constexpr-specific correctness work. We still need explicit checks for
+   not eliminate constexpr-specific correctness work. The evaluator still needs explicit checks for
    constant-evaluation rules that are stricter than runtime execution.
 
 3. **Performance**: Native execution is orders of magnitude faster than AST interpretation.
@@ -1386,7 +1380,7 @@ constexpr int x = factorial(10);  // needs compile-time evaluation
    targeted semantic checks in the evaluator.
 
 **Handling transitive calls**: `consteval` functions can call other `constexpr`
-functions, use `std::` algorithms, etc. We compile the entire transitive closure of
+functions, use `std::` algorithms, etc. The evaluator compiles the entire transitive closure of
 called functions. This is the same lazy compilation model as the runtime JIT — when
 a called function hasn't been compiled yet, compile it on demand.
 
@@ -1400,7 +1394,7 @@ Solution: compile `consteval` code with **lightweight sanitizer instrumentation*
 - Division by zero → insert zero-check before division
 - Shift by negative/too-large amount → insert range checks
 
-This is far simpler than a full AST interpreter because we're inserting checks during
+This is far simpler than a full AST interpreter because forgecc inserts checks during
 lowering rather than reimplementing the whole C++ execution model.
 
 **Beyond UB checks**: `constexpr` requires enforcing abstract-machine constraints that
@@ -1409,7 +1403,7 @@ provenance, constant initialization/destruction rules, and forbidden operations 
 constant-evaluation context. These are validated in Sema and a dedicated IR validation
 pass before JIT execution.
 
-**Hybrid evaluator strategy (recommended)**: JIT-first for the common subset, with a
+**Hybrid evaluator strategy**: JIT-first for the common subset, with a
 ForgeIR interpreter fallback for cases where strict abstract-machine tracking is easier
 or safer than native execution. This preserves the "no full AST interpreter" goal while
 maintaining standards conformance.
@@ -1445,8 +1439,18 @@ requires `consteval` to evaluate under target semantics. Two strategies:
    Windows x64 (pure C with Rust bindings, thread-safe). This preserves the
    performance advantage of native execution while honoring target semantics.
 
-For the PoC (x86-64 → x86-64 only), this is not needed — native JIT is correct.
-The emulation path is future work for the console cross-compilation scenario (§20.1).
+For the PoC (x86-64 → x86-64 only), host-native JIT is the fast path, and it
+runs in an isolated evaluator context (separate process and sanitized runtime
+state) rather than sharing mutable host state directly.
+
+**Isolation policy for `consteval` evaluation**:
+- **Fast path (default)**: host-native JIT in an isolated evaluator process.
+- **Strict path**: ForgeIR interpreter for maximal semantic control.
+- **Cross-target path**: target emulation (QEMU/Unicorn) when host and target semantics differ.
+
+QEMU is not the default for same-target evaluation because its overhead is too high for
+the edit-build-debug loop. QEMU/Unicorn is the mandated path for cross-target
+correctness and available as a strict verification mode.
 
 ### 4.6b ForgeIR — Intermediate Representation
 
@@ -1464,7 +1468,7 @@ and how the alternatives compare:
 | **Rust interop** | Native | FFI to C++ MLIR libraries (or Rust MLIR bindings) | FFI to C++ LLVM (`inkwell` / `llvm-sys` crates) |
 | **Memoization** | Full control over hashing and serialization | Full control | **Hard** — non-deterministic metadata IDs, pointer identity, global numbering make content-addressing difficult |
 | **Determinism** | Full control over ordering | Full control | **Difficult** — many sources of non-determinism (metadata `!0`/`!1` numbering, type uniquing, unnamed value `%0`/`%1` sequencing depend on emission order) |
-| **Incremental granularity** | Function-level (our design) | Function-level (our design) | **Naturally module-oriented** — LLVM's primary unit is a `Module`; function-level reuse is possible but requires additional partitioning/canonicalization infrastructure |
+| **Incremental granularity** | Function-level (forgecc design) | Function-level (forgecc design) | **Naturally module-oriented** — LLVM's primary unit is a `Module`; function-level reuse is possible but requires additional partitioning/canonicalization infrastructure |
 | **JIT** | Must build loader | Must build loader | **LLVM ORC JIT available** — mature, handles relocations, exception tables, TLS |
 | **Codegen quality (-O0)** | Our codegen (sufficient) | Our codegen (sufficient) | LLVM's codegen (higher quality but overkill for -O0) |
 | **Codegen quality (-O2+)** | Not available | Not available | **Full LLVM optimization pipeline** — critical for release builds |
@@ -1486,21 +1490,21 @@ and how the alternatives compare:
    pipeline.
 
 LLVM IR does give us a mature JIT (ORC), all SIMD intrinsics for free, and
-production-quality codegen for release builds. We capture these benefits through
+production-quality codegen for release builds. forgecc captures these benefits through
 the **hybrid path** described below, without giving up control over the dev pipeline.
 
 **Why not MLIR**: MLIR is a C++ library. Adding a C++ dependency to a Rust project
 adds significant build complexity. MLIR's abstractions (dialects, passes) are
-powerful but unnecessary for the PoC — our IR is simple enough that a custom
+powerful but unnecessary for the PoC — ForgeIR is simple enough that a custom
 implementation is smaller and faster to iterate on.
 
 **Hybrid path for release builds**: ForgeIR is used for the development pipeline
-(where we need full control over determinism, memoization, and function-level
+(where forgecc needs full control over determinism, memoization, and function-level
 granularity). For release builds with -O2+ optimizations, ForgeIR lowers to
 LLVM IR to leverage the full LLVM optimization pipeline. This is the same pattern
 used by Swift (SIL → LLVM IR) and Rust (MIR → LLVM IR). The release-mode path:
 `ForgeIR → LLVM IR → LLVM opt → LLVM codegen → .obj`. This path is deferred —
-the PoC focuses on -O0 / JIT where our own codegen is sufficient.
+the PoC focuses on -O0 / JIT where forgecc codegen is sufficient.
 
 ForgeIR uses MLIR-compatible concepts (operations, regions, blocks) so that
 migration to MLIR is straightforward if the need arises post-PoC.
@@ -1524,7 +1528,7 @@ entry:
 
 ### 4.7 x86-64 Code Generation
 
-Generates machine code from ForgeIR. Since we're targeting unoptimized code, this is
+Generates machine code from ForgeIR. Since forgecc targets unoptimized code here, this is
 essentially a 1:1 lowering.
 
 **SIMD intrinsics support**: This is critical. Based on codebase analysis, UE5 uses
@@ -1541,7 +1545,7 @@ just faithful 1:1 translation.
 
 **Inline assembly (`__asm`)**: Based on analysis, only **~23 files** use `__asm` in
 Engine/Source/Runtime, mostly in:
-- Audio codecs (Bink Audio, Rad Audio) — third-party, likely can be linked as prebuilt
+- Audio codecs (Bink Audio, Rad Audio) — third-party, linked as prebuilt where practical
 - Platform detection (`cpux86.cpp`)
 - Floating point state manipulation
 - LongJump (AutoRTFM)
@@ -1609,6 +1613,29 @@ shape, base-class changes) require either object migration or a process restart.
 For the PoC, restart-on-ABI-change is the default safety policy; live object migration
 is future work (see §17.5).
 
+**Hot-patch contract (PoC, normative)**:
+
+- **Patchable now**: function body edits that preserve ABI shape (same signature,
+  calling convention, parameter/return ABI, and referenced type layouts).
+- **Guarded / restart-only**: class layout changes, vtable shape changes, base-class
+  changes, calling-convention changes, and any edit that requires migrating live objects.
+- **Atomicity**: patch application is all-or-nothing at a safepoint. On failure, keep
+  old code active and return an explicit diagnostic/restart-required status.
+
+**Runtime preconditions before resume**:
+
+1. All external symbol references for the patch set are resolved.
+2. Unwind metadata (`.pdata`/`.xdata`) is registered for newly mapped code.
+3. TLS registration for newly mapped code succeeded (or target does not require TLS).
+4. No active stack frame executes code that is being replaced in-place.
+5. Debug metadata for patched functions is published as one versioned update.
+
+**Failure policy**:
+
+- If any precondition above fails, the daemon must not partially apply the patch.
+- For ABI-epoch mismatches with no proven adapter/migration path, return
+  `restart_required` and keep execution on the previous code epoch.
+
 **Debugging: DAP-first approach (no PDB generation)**
 
 Since the daemon always reconstructs the executable in-memory and acts as the loader,
@@ -1640,7 +1667,7 @@ the JIT-compiled application directly.
 - DAP server implementation (~1,500 lines) — well-documented JSON-over-stdio protocol
 - Process debugging primitives (~1,000 lines) — `WaitForDebugEvent`, `ReadProcessMemory`,
   `WriteProcessMemory`, `SetThreadContext`, hardware breakpoints
-- Stack unwinding logic (~500 lines) — simpler than PDB because we control frame layout
+- Stack unwinding logic (~500 lines) — simpler than PDB because forgecc controls frame layout
 
 **Net effect (PoC)**: lower dev-loop complexity, but not elimination of debug-format
 complexity overall. PDB/CodeView still matters for release builds and ecosystem interop.
@@ -1648,8 +1675,8 @@ complexity overall. PDB/CodeView still matters for release builds and ecosystem 
 **The application requires the daemon to run**: This is a fundamental architectural
 property. The target application can only start if the daemon is up, because the daemon
 creates the process, maps code into it, and manages its execution. The daemon
-reconstructs the executable from the content-addressed store on startup (which should
-be fast due to caching). This is analogous to how a JVM or .NET CLR must be running
+reconstructs the executable from the content-addressed store on startup (fast due to
+caching). This is analogous to how a JVM or .NET CLR must be running
 for managed applications to execute.
 
 **Release mode**: For shipping builds (not day-to-day development), the daemon can
@@ -1689,12 +1716,12 @@ template instantiation (as the One Definition Rule requires), the linker must pi
 exactly one. In a content-addressed system this is naturally deterministic: identical
 definitions produce the same content hash and collapse to a single store entry. For
 ODR-*violating* definitions (different content hashes for the same mangled name), the
-linker emits a hard error and aborts producing a loadable image. The build may expose
-an explicit opt-in escape hatch for investigation, but the default policy is fail-fast.
+linker emits a hard error and aborts producing a loadable image. The build exposes
+an explicit opt-in escape hatch for investigation, while the default policy is fail-fast.
 
 **UE5 DLL structure**: The Game editor target builds **~190 modules** (see §15.5),
 each as a separate DLL. The `*_API` macro pattern (`CORE_API`, `ENGINE_API`, etc.)
-controls `__declspec(dllexport/dllimport)`. In JIT mode, we can ignore DLL boundaries
+controls `__declspec(dllexport/dllimport)`. In JIT mode, forgecc ignores DLL boundaries
 entirely and treat everything as a single address space.
 
 **Incremental linking** (release mode): When only a few functions change:
@@ -1790,7 +1817,7 @@ forge-daemon
     │   ├── /v1/compile      — compile actions (forge-cc / clang-cl equivalent)
     │   ├── /v1/link         — link actions (forge-link / lld-link equivalent)
     │   ├── /v1/lib          — static library actions (forge-lib / llvm-lib equivalent)
-    │   ├── /v1/rc           — resource compile actions (forge-rc / llvm-rc equivalent)
+    │   ├── /v1/rc           — resource compile actions (forge-rc native implementation)
     │   ├── /v1/ml           — assembly actions (forge-ml / llvm-ml equivalent)
     │   ├── /v1/artifact/    — content-addressed artifact get/put (local + P2P)
     │   └── /v1/peers        — peer discovery (gossip protocol)
@@ -1816,13 +1843,13 @@ forge-daemon
 
 **File watching**: The daemon watches source directories. When a file is saved, it
 begins pre-compilation immediately, before UBT even sends the compile action. By the
-time the user triggers a build, the work may already be done.
+time the user triggers a build, the work is already done in the common case.
 
-**UBT bypass (future optimization)**: Eventually, the daemon could cache UBT's
-command lines and use the file watcher to detect changes, making UBT invocations
-unnecessary for incremental builds. UBT would still be needed for the initial
+**UBT bypass (future optimization)**: The daemon caches UBT command lines and uses the
+file watcher to detect changes, making UBT invocations unnecessary for incremental
+builds. UBT remains necessary for the initial
 "Makefile" generation (module discovery, dependency graph), but subsequent rebuilds
-could be driven entirely by the daemon's file watcher + cached command lines.
+are driven entirely by the daemon's file watcher + cached command lines.
 
 **Parallelism model**: The daemon uses a work-stealing thread pool (rayon). Parallelism
 occurs at multiple levels:
@@ -1907,6 +1934,33 @@ connection.
 independently, they produce the same output (deterministic compilation). The DHT is
 eventually consistent.
 
+**Security / trust model**:
+
+- **PoC default**: trusted workstation/LAN mode. Integrity is enforced by content hashes;
+  peer identity/provenance policy is local and simplified.
+- **Production target**: **zero-trust peers**. Every daemon has a stable cryptographic
+  identity; all peer traffic is mutually authenticated and encrypted.
+
+**Artifact provenance**:
+
+Each artifact is stored with a signed provenance envelope containing:
+1. artifact hash (`blake3`)
+2. compiler identity + version + build config digest
+3. target triple + ABI-relevant flags digest
+4. source/input root digest (workspace snapshot or VCS commit + command digest)
+5. dependency artifact hashes
+6. builder signature (or attestation token)
+
+Local daemon acceptance policy:
+- Always verify content hash.
+- In zero-trust mode, require valid signature/attestation from trusted identities.
+- High-assurance policy requires **N-of-M reproducible attestations** (independent
+  builders produce the same hash) for designated artifact classes (for example,
+  release-critical paths).
+
+This avoids blockchain-style global consensus for every artifact (too expensive for the
+inner dev loop) while still enabling strong supply-chain assurances when needed.
+
 ### 4.13 Unified Protocol Design (HTTP + MessagePack/JSON)
 
 **forgecc** uses a single transport for **all** communication: build system to daemon,
@@ -1918,19 +1972,24 @@ architectural choice — one code path, one port, one protocol.
 All communication uses **HTTP/2** over TCP. This includes local communication
 (`http://localhost:9473`) and remote communication (`http://peer:9473`).
 
+**Transport security modes**:
+- **PoC / trusted LAN**: plaintext HTTP/2 is acceptable for iteration speed.
+- **Zero-trust / production**: HTTPS (TLS) with **mutual TLS (mTLS)** between daemons
+  and authenticated client credentials for build-system callers.
+
 **Why HTTP/2** (not HTTP/1.1 or HTTP/3):
 
 HTTP/2's key feature is **multiplexing** — many concurrent request/response exchanges
 over a **single TCP connection**, with no head-of-line blocking between streams. This
-maps perfectly to our workload:
+maps perfectly to the forgecc workload:
 
 - **Build system → daemon**: UBT/ninja sends hundreds of compile actions in parallel.
   With HTTP/1.1, this would require hundreds of TCP connections (or serialize requests,
   killing parallelism). With HTTP/2, **one connection** handles all of them as
   concurrent streams. The daemon receives them in parallel and responds as each
   completes — out of order, no blocking.
-- **Daemon → peer daemons**: When fetching artifacts from a peer, the daemon may
-  request dozens concurrently. HTTP/2 multiplexes all of them on a single connection
+- **Daemon → peer daemons**: When fetching artifacts from a peer, the daemon requests
+  dozens concurrently. HTTP/2 multiplexes all of them on a single connection
   per peer — no connection pool management, no per-request TCP handshake overhead.
 - **Connection lifecycle**: HTTP/2 connections are long-lived. The build system opens
   one connection to the daemon at startup and reuses it for the entire build session.
@@ -2015,7 +2074,7 @@ curl -X POST -H "Content-Type: application/json" -H "Accept: application/json" \
 **Why not gRPC / Cap'n Proto / FlatBuffers**: These require schema compilation (`.proto`
 files, code generation) which adds build complexity. MessagePack + serde gives us
 schema-from-code (the Rust structs ARE the schema), zero code generation, and the
-JSON fallback for free. gRPC's framing also makes `curl` debugging harder — our
+JSON fallback for free. gRPC's framing also makes `curl` debugging harder — this
 approach lets you `curl` any endpoint with `Accept: application/json` and get readable
 output.
 
@@ -2196,11 +2255,11 @@ forgecc/
 │   │   ├── src/
 │   │   │   ├── main.rs           # Entry point: argv[0] detection, dispatch
 │   │   │   ├── detect.rs         # Tool name detection (forge-cc, forge-link, etc.)
-│   │   │   ├── args_cc.rs        # clang-cl flag parsing → CompileAction
-│   │   │   ├── args_link.rs      # lld-link flag parsing → LinkAction
-│   │   │   ├── args_lib.rs       # llvm-lib flag parsing → LibAction
-│   │   │   ├── args_rc.rs        # llvm-rc flag parsing → RcAction
-│   │   │   ├── args_ml.rs        # llvm-ml flag parsing → MlAction
+│   │   │   ├── args_cc.rs        # forge-cc flag parsing (clang-cl-compatible) → CompileAction
+│   │   │   ├── args_link.rs      # forge-link flag parsing (lld-link-compatible) → LinkAction
+│   │   │   ├── args_lib.rs       # forge-lib flag parsing (llvm-lib-compatible) → LibAction
+│   │   │   ├── args_rc.rs        # forge-rc flag parsing (MSVC/LLVM-compatible) → RcAction
+│   │   │   ├── args_ml.rs        # forge-ml flag parsing (llvm-ml-compatible) → MlAction
 │   │   │   ├── client.rs         # HTTP/2 client (reqwest) → daemon RPC
 │   │   │   └── autostart.rs      # Daemon auto-start (spawn, wait for /v1/status)
 │   │   └── Cargo.toml
@@ -2330,7 +2389,7 @@ unique (TU, input context) is compiled **once** across the entire team and CI; e
 other daemon fetches the artifact by hash.
 
 **Implication for weekly savings:** The benefit is not only "one full rebuild is 2×
-faster" but "**across the whole team and all build machines, we compile much less
+faster" but "**across the whole team and all build machines, the system compiles much less
 in total**." Aggregate compilation work in a week can drop by a large factor because
 work is shared instead of repeated.
 
@@ -2382,6 +2441,46 @@ cluster endpoints, auth, and tuning. **forgecc** provides equivalent behavior
 **Value proposition:** Teams get **shared caching and distribution** by running
 **forgecc** daemons and connecting them (e.g. via seeds). No separate distribution
 or cache infrastructure to deploy or maintain.
+
+### 6.8 Quantitative Expectations (Build Time + Storage)
+
+This section sets practical expectations for a fully implemented forgecc stack in
+developer workflows (`-O0` / fast-iteration mode). These ranges are planning targets,
+not guarantees, and depend on cache warmth, change shape, memory pressure, and
+workspace policy.
+
+**Important operating model**: true full rebuilds are primarily a **first import**
+event (or explicit cache wipe / toolchain epoch reset). After import, steady-state
+development is overwhelmingly incremental. Most rebuilds recompile a small delta.
+
+**Build-time reduction ranges**:
+
+| Codebase | Full rebuild (cold import / forced invalidation) | Incremental: `.cpp` body change | Incremental: header/API change |
+|---|---|---|---|
+| **Clang/LLD** | ~0.9×–1.3× vs baseline toolchain | ~3×–10× faster | ~1.5×–4× faster |
+| **Chromium** | ~0.8×–1.2× vs baseline toolchain | ~5×–20× faster | ~2×–8× faster |
+| **Unreal Engine** | ~0.8×–1.3× vs baseline toolchain | ~8×–30× faster | ~3×–12× faster |
+
+Interpretation:
+- Full rebuild speedup is moderate because most work is genuinely new on a cold import.
+- Incremental speedup is large because unchanged units/functions/templates are skipped
+  and cache hits dominate.
+- Team/CI aggregate reduction in total compile work is typically **3×–8×** due to
+  cross-machine hash reuse (§6.6).
+
+**Storage / artifact footprint expectations**:
+
+| Storage view | Traditional model (.obj/.pdb intermediates) | forgecc model (index + content store) |
+|---|---|---|
+| **Build index metadata** | N/A | Tiny relative footprint (typically <<1% of total) |
+| **Intermediate duplication** | High (near-duplicate artifacts repeated across builds) | Low (content-addressed dedup across stages and builds) |
+| **Single-machine active workspace** | Baseline | Typically ~20%–60% lower net footprint after warm-up |
+| **Cross-machine/team footprint + transfer** | Large repeated artifact transfer | Hash-addressed reuse; only missing content transfers |
+
+Storage notes:
+- The content store carries metadata overhead, but deduplication and reuse dominate in
+  steady-state development.
+- Retention policy (GC horizon, branch pinning, CI pin sets) determines long-tail size.
 
 ---
 
@@ -2439,11 +2538,11 @@ executable**, distinguished by `argv[0]` — the same pattern clang uses for
 
 ```
 forge-daemon.exe     ← main binary (the daemon)
-forge-cc.exe         ← symlink/copy, clang-cl-compatible compiler driver
-forge-link.exe       ← symlink/copy, lld-link-compatible linker driver
-forge-lib.exe        ← symlink/copy, llvm-lib-compatible librarian driver
-forge-rc.exe         ← symlink/copy, llvm-rc-compatible resource compiler driver
-forge-ml.exe         ← symlink/copy, llvm-ml-compatible assembler driver
+forge-cc.exe         ← symlink/copy, native compiler driver (clang-cl-compatible CLI)
+forge-link.exe       ← symlink/copy, native linker driver (lld-link-compatible CLI)
+forge-lib.exe        ← symlink/copy, native librarian driver (llvm-lib-compatible CLI)
+forge-rc.exe         ← symlink/copy, native resource compiler driver
+forge-ml.exe         ← symlink/copy, native assembler driver (llvm-ml-compatible CLI)
 ```
 
 **argv[0] detection**: On startup, the binary extracts the filename from `argv[0]`,
@@ -2467,13 +2566,13 @@ automatically.
 
 **Tool-to-endpoint mapping**:
 
-| Driver binary | Emulates | Daemon endpoint | Flags accepted |
+| Driver binary | CLI compatibility target | Daemon endpoint | Flags accepted |
 |---|---|---|---|
-| `forge-cc.exe` | `clang-cl.exe` | `/v1/compile` | `/c`, `/Fo`, `/I`, `/D`, `-std:c++20`, etc. |
-| `forge-link.exe` | `lld-link.exe` | `/v1/link` | `/OUT:`, `/DLL`, `/LIBPATH:`, `.obj` paths |
-| `forge-lib.exe` | `llvm-lib.exe` | `/v1/lib` | `/OUT:`, `.obj` paths |
-| `forge-rc.exe` | `llvm-rc.exe` | `/v1/rc` | `/fo`, `.rc` path |
-| `forge-ml.exe` | `llvm-ml64.exe` | `/v1/ml` | `/c`, `/Fo`, `.asm` path |
+| `forge-cc.exe` | clang-cl-compatible CLI | `/v1/compile` | `/c`, `/Fo`, `/I`, `/D`, `-std:c++20`, etc. |
+| `forge-link.exe` | lld-link-compatible CLI | `/v1/link` | `/OUT:`, `/DLL`, `/LIBPATH:`, `.obj` paths |
+| `forge-lib.exe` | llvm-lib-compatible CLI | `/v1/lib` | `/OUT:`, `.obj` paths |
+| `forge-rc.exe` | native `.rc` compiler (MSVC/LLVM-compatible CLI) | `/v1/rc` | `/fo`, `.rc` path |
+| `forge-ml.exe` | llvm-ml-compatible CLI | `/v1/ml` | `/c`, `/Fo`, `.asm` path |
 
 **Implementation**: The driver is a single Rust crate (`forge-driver`, ~800 lines)
 that compiles to one binary. The build system produces the binary as `forge-daemon.exe`
@@ -2544,7 +2643,7 @@ support. No CMake changes needed.
 2. **`try_compile`** — compiles a small test program and produces a `.obj`.
    The driver forwards to the daemon, which produces a valid COFF `.obj`.
 3. **Feature detection** — compiles snippets to detect C++ standard support
-   (`-std:c++20`, etc.). Works because we accept clang-cl flags.
+   (`-std:c++20`, etc.). This works because forgecc accepts clang-cl flags.
 4. **ABI detection** — compiles `CMakeCXXCompilerABI.cpp` and inspects the
    `.obj` for ABI information. Our `.obj` must be valid COFF with correct
    section names and symbol types.
@@ -2804,8 +2903,8 @@ Rather than jumping from "Hello World" to UE5, **forgecc** is validated against 
 of real-world open-source C/C++ projects of increasing complexity. Each **target level**
 (numbered with Roman numerals I–X) serves as a milestone gate: the compiler must
 produce correct, runnable output for a given target level before moving to the next.
-(Target levels are distinct from implementation phases — phases describe *what we
-build*, target levels describe *what we validate against*.)
+(Target levels are distinct from implementation phases — phases describe *what is
+built*, target levels describe *what is validated against*.)
 
 | Target Level | Project | ~LoC | Why | Key features exercised |
 |---|---|---|---|---|
@@ -2929,7 +3028,7 @@ debugging individual compilation issues.
 | Performance of unoptimized code | Medium | Medium | UE5 debug builds are already unoptimized; acceptable |
 | SIMD intrinsic coverage | Medium | High | Map intrinsics incrementally; start with SSE2, add SSE4/AVX as needed |
 | Windows SDK header complexity | High | High | Test incrementally; many headers are already handled by preprocessor |
-| Distributed store consistency / trust boundaries | Medium | High | Determinism verification (`--verify-determinism`), protocol/version checks, content-hash verification, bounded peer trust |
+| Distributed store consistency / trust boundaries | Medium | High | Determinism verification (`--verify-determinism`), protocol/version checks, content-hash verification, mTLS peer identity, signed provenance envelopes, policy-gated acceptance (optional N-of-M attestation) |
 | Parallelism correctness | Medium | High | Rust ownership helps, but require deterministic merge order and stress/fuzz testing of concurrent paths |
 
 ---
@@ -2972,7 +3071,7 @@ debugging individual compilation issues.
 | `forge-debug` | 3,000 | DAP server + breakpoints + variable inspection |
 | `forge-link` | 6,000 | Linker + PE + DLL (PDB deferred to release mode) |
 | `forge-daemon` | 5,500 | Daemon + scheduler + loader/JIT + determinism verification (HTTP server moved to forge-net) |
-| `forge-driver` | 800 | Thin driver binaries: argv[0] detection, clang-cl/lld-link/llvm-lib/llvm-rc/llvm-ml flag parsing, HTTP client, daemon auto-start (see §7.3) |
+| `forge-driver` | 800 | Thin native driver binaries: argv[0] detection; clang-cl/lld-link/llvm-lib/MSVC-LLVM-rc/llvm-ml compatible flag parsing; HTTP client; daemon auto-start (see §7.3) |
 | `forge-verify` | 1,500 | Verification CLI: daemon client, reference compiler diff, execution diff (see §8b) |
 | **Total** | **~110,300** | + ~300–500 lines C++ ninja patch (external, see §7.4) |
 
@@ -3046,7 +3145,7 @@ from **memoization** — if 90% of headers haven't changed, the TU might take
 **5–15 seconds** on a warm cache regardless of parallelism.
 
 **Honest assessment**: Intra-TU parallelism is a **moderate** win. The
-**memoization/caching** is the transformative win. Parallelism across TUs (which we
+**memoization/caching** is the transformative win. Parallelism across TUs (already
 already have) plus caching is where 90% of the speedup comes from.
 
 ### 12.5 Across Machines
@@ -3078,8 +3177,8 @@ redundant work that unity files were designed to avoid.
 
 ## 13. Standard Library Strategy
 
-**We do NOT compile the MSVC STL.** The STL headers are `#include`d in source files
-and processed by our preprocessor/parser/sema like any other header. But we **link
+**forgecc does NOT compile the MSVC STL.** The STL headers are `#include`d in source files
+and processed by the preprocessor/parser/sema like any other header. forgecc **links
 against** the precompiled MSVC runtime libraries:
 
 - `vcruntime.lib` — C runtime basics
@@ -3092,7 +3191,7 @@ This means:
 - Our linker must read MSVC import libraries (.lib)
 - Our generated code must be ABI-compatible with MSVC-compiled code in these libraries
 
-The UE5 editor target uses DLLs, so we link against the DLL versions of the CRT
+The UE5 editor target uses DLLs, so forgecc links against the DLL versions of the CRT
 (`/MD` flag equivalent).
 
 ---
@@ -3107,7 +3206,7 @@ The UE5 editor target uses DLLs, so we link against the DLL versions of the CRT
 - C++20 modules exist primarily for build time improvement — **forgecc** achieves the
   same through its memoization/caching system, making modules redundant
 - C++20 modules add significant compiler complexity (module dependency scanning,
-  BMI generation, build ordering constraints) for no benefit in our target codebase
+  BMI generation, build ordering constraints) for no benefit in the target codebase
 
 The architecture naturally supports modules (the content-addressed store handles
 BMI caching), so adding them post-PoC is straightforward if a target codebase
@@ -3268,7 +3367,8 @@ requires them.
 ### 15.12 Resource Compiler (.rc) Files
 - **137 .rc files** in Engine/Source (44 in Runtime/Launch, rest in ThirdParty)
 - Primary: `Runtime/Launch/Resources/Windows/PCLaunch.rc`
-- **Out of scope for forgecc** — .rc files are compiled by `rc.exe`, not the C++ compiler
+- Supported natively via `forge-rc.exe` in the PoC (CLI-compatible with existing
+  MSVC/LLVM `.rc` usage patterns)
 
 ### 15.13 UBT Compiler Invocation
 - `VCToolChain.cs` (~3,979 lines) handles both MSVC and clang-cl modes
@@ -3311,7 +3411,7 @@ Reference: [Deterministic builds with clang and lld](https://blog.llvm.org/2019/
 
 2. **No non-deterministic iteration order**: All internal data structures that affect
    output must use deterministic iteration (sorted maps, not hash maps with random seeds).
-   Rust's `HashMap` uses RandomState by default — we must use `BTreeMap` or a
+   Rust's `HashMap` uses RandomState by default — forgecc uses `BTreeMap` or a
    deterministic hasher for any map that affects output ordering.
 
 3. **No pointer-value-dependent output**: Addresses of AST nodes, types, etc. must not
@@ -3332,10 +3432,11 @@ Reference: [Deterministic builds with clang and lld](https://blog.llvm.org/2019/
    independent of thread scheduling. This means:
    - No output in "order threads finish"
    - Merge parallel results in a deterministic order (e.g., sorted by symbol name)
-   - Use deterministic work-stealing (seed the work queue deterministically)
+   - Deterministic scheduling is **not required**; only deterministic outputs and
+     deterministic merge order are required
 
 6. **No `__COUNTER__` across TUs**: `__COUNTER__` is inherently TU-local and
-   deterministic within a TU, so it's fine. But we must ensure it doesn't leak across
+   deterministic within a TU, so it's fine. forgecc ensures it doesn't leak across
    TU boundaries.
 
 6b. **Floating-point determinism**: Floating-point constant folding and `constexpr`
@@ -3415,7 +3516,7 @@ early, whether they originate in output formatting or in pipeline computations.
 
 ### 17.1 Import Library Parsing
 
-Even in JIT mode, we need `.lib` parsing for **symbol validation** before execution.
+Even in JIT mode, forgecc needs `.lib` parsing for **symbol validation** before execution.
 The daemon must know what symbols are available from external DLLs (kernel32, d3d12,
 ucrt, vcruntime, etc.) to validate that all references can be resolved.
 
@@ -3467,7 +3568,7 @@ already proven.
 ### 17.4 Exception Handling
 
 SEH and C++ exceptions require `.pdata`/`.xdata` sections and runtime support. In JIT
-mode, we need to register unwind info with `RtlAddFunctionTable` or
+mode, forgecc registers unwind info with `RtlAddFunctionTable` or
 `RtlInstallFunctionTableCallback` for each JIT-compiled function.
 
 This is well-understood territory — LLVM's ORC JIT does the same thing. The key is
@@ -3497,6 +3598,30 @@ references must be updated. This requires:
 
 For the PoC, the default policy is conservative: **restart on ABI-shape change**.
 This keeps behavior correct while body-only edits remain hot-patchable.
+
+**Invariants (must always hold)**:
+
+1. **Epoch-correct dispatch**: Every call edge and vtable slot dispatches to code that
+   expects the same ABI epoch as the object/signature at that boundary.
+2. **No silent reinterpretation**: An object of old layout is never treated as the new
+   layout without an explicit proven adapter or migration.
+3. **Stack safety first**: Stack-resident objects are not migrated in-place in PoC mode.
+4. **Deterministic fallback**: If invariants cannot be proven, patch is rejected and a
+   restart is required.
+
+**Preconditions for future in-place migration**:
+
+- The type delta is classified as migratable (e.g., field-preserving or explicitly mapped).
+- A generated migrator or user-provided callback exists and type-checks against both epochs.
+- Migration runs at a safepoint where target objects are discoverable and quiescent.
+- All cross-epoch boundaries are covered by verified adapters (or explicitly blocked).
+
+**Cross-epoch ABI adaptation note**:
+
+Keeping old and new code alive simultaneously can be safe only with explicit boundary
+adapters. For example, old-layout pointers passed into new code require a thunk that
+either (a) migrates to new layout before call, or (b) routes to old-epoch implementation.
+Absent such an adapter, the call is invalid and must be rejected/restarted.
 
 ---
 
@@ -3804,7 +3929,7 @@ relevant sections above.
 | §13 Templates | ✅ Covered | Added: CTAD/deduction guides, template template params, class-type NTTPs, two-phase lookup, variable template instantiation |
 | §14 Exception handling | ✅ Covered | SEH + C++ exceptions; added: noexcept as part of function type |
 | §15 Preprocessing | ✅ Covered | Added: #pragma pack/warning, #line, #error, #warning, __has_builtin, __has_feature, feature-test macros, predefined macros |
-| §16–§33 Library | N/A | We link against MSVC STL; must parse STL headers but don't implement the library |
+| §16–§33 Library | N/A | forgecc links against MSVC STL; it parses STL headers but does not implement the library |
 
 ### 21.2 Intentionally Unsupported (with Justification)
 

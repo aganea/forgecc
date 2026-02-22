@@ -817,19 +817,24 @@ ADL is the single most dangerous dependency for memoization correctness. Conside
 ```cpp
 namespace game {
     struct Actor { /* ... */ };
+    void serialize(const Actor& a) { /* old implementation */ }
 }
 
 // In TU A (compiled first):
-template<class T> void process(T& x) { serialize(x); }  // ADL finds game::serialize
+template<class T> void process(T& x) { serialize(x); }  // ADL finds game::serialize(const Actor&)
 void foo() { game::Actor a; process(a); }
+```
 
-// Later, someone adds to game namespace:
+Later, someone adds a new overload in the same namespace:
+
+```cpp
 namespace game {
-    void serialize(Actor& a) { /* new implementation */ }
+    void serialize(Actor& a) { /* new overload / implementation */ }
 }
 ```
 
-Adding `game::serialize` changes the ADL result for `process<game::Actor>`. The
+Adding `game::serialize(Actor&)` changes the ADL/overload result for
+`process<game::Actor>`. The
 memoized instantiation of `process<game::Actor>` must be invalidated.
 
 **Tier 1 handles this correctly** because `instantiation_context_hash` includes all

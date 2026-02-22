@@ -4,9 +4,9 @@ An incremental, distributed C++20 compiler and linker, written in Rust, running 
 
 ## What is this?
 
-**forgecc** is a proof-of-concept C++ compiler designed to dramatically reduce build times for large codebases (target: Unreal Engine 5). Instead of the traditional compile-then-link cycle that produces object files on disk, forgecc runs as a long-lived daemon that compiles, links, loads, and debugs C++ code entirely in-memory.
+**forgecc** is a thought experiment exploring what a C++ compiler could look like if designed from scratch around memoization, daemon persistence, and JIT execution. The goal is to dramatically reduce build times for large codebases (target: Unreal Engine 5) by replacing the traditional compile-then-link cycle with a long-lived daemon that compiles, links, loads, and debugs C++ code entirely in-memory.
 
-It is informed by LLVM/Clang's architecture but is a clean implementation, not a fork. It targets **C++20, x86-64, Windows** initially.
+It is informed by LLVM/Clang's architecture but is a clean implementation, not a fork. It targets **C++20, x86-64, Windows** initially. Whether all of the ideas described here are feasible at scale is an open question — the design document is the exploration itself.
 
 ## Key ideas
 

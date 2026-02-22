@@ -2,13 +2,60 @@
 
 **Status**: Proposal / Architecture Draft  
 **Author**: Alexandre Ganea  
-**Date**: 2026-02-15  
+**Updated**: 2026-02-22
+
+---
+
+**Table of Contents**
+
+- [1. Executive Summary](#1-executive-summary)
+- [2. Design Principles](#2-design-principles)
+- [2b. Why a New Compiler Instead of Modifying LLVM/Clang](#2b-why-a-new-compiler-instead-of-modifying-llvmclang)
+- [3. High-Level Architecture](#3-high-level-architecture)
+- [4. Component Design](#4-component-design)
+  - [4.1 The Distributed Content-Addressed Store](#41-the-distributed-content-addressed-store-ipfs-like)
+  - [4.2 The Memoizer](#42-the-memoizer)
+  - [4.3 Lexer & Preprocessor](#43-lexer--preprocessor)
+  - [4.4 Parser](#44-parser)
+  - [4.5 Semantic Analysis (Modular Design)](#45-semantic-analysis-modular-design)
+  - [4.6a consteval/constexpr via In-Process JIT](#46a-constevalconstexpr-via-in-process-jit-key-innovation)
+  - [4.6b ForgeIR — Intermediate Representation](#46b-forgeir--intermediate-representation)
+  - [4.7 x86-64 Code Generation](#47-x86-64-code-generation)
+  - [4.8 Runtime Loader / JIT Execution](#48-runtime-loader--jit-execution)
+  - [4.9 Linker](#49-linker)
+  - [4.10 Unreal Build Tool (UBT) Integration](#410-unreal-build-tool-ubt-integration-command-passing-protocol)
+  - [4.11 Daemon Architecture](#411-daemon-architecture)
+  - [4.12 Distributed P2P Network](#412-distributed-p2p-network-ipfs-like)
+  - [4.13 Unified Protocol Design](#413-unified-protocol-design-http--messagepackjson)
+- [5. Crate Structure](#5-crate-structure)
+- [6. Key Data Flows](#6-key-data-flows)
+- [7. Build System Integration](#7-build-system-integration)
+- [8. Phased Implementation Plan](#8-phased-implementation-plan)
+- [9. Risk Assessment](#9-risk-assessment)
+- [10. Key Dependencies (Rust Crates)](#10-key-dependencies-rust-crates)
+- [11. Lines-of-Code Estimates](#11-lines-of-code-estimates)
+- [12. Parallelism Strategy (Detailed)](#12-parallelism-strategy-detailed)
+- [13. Standard Library Strategy](#13-standard-library-strategy)
+- [14. C++20 Modules Decision](#14-c20-modules-decision)
+- [15. UE5 Codebase Analysis Findings](#15-ue5-codebase-analysis-findings-verified-against-source)
+- [16. Deterministic Compilation (Required)](#16-deterministic-compilation-required)
+- [17. JIT Runtime Details](#17-jit-runtime-details)
+- [18. Live PGO Injection (PoC Feature)](#18-live-pgo-injection-poc-feature)
+- [19. A VM for C++?](#19-a-vm-for-c)
+- [20. Future Work (Beyond the PoC)](#20-future-work-beyond-the-poc)
+  - [20.1 Console Development](#201-console-development-ps5-xbox-series-x-nintendo-switch)
+  - [20.2 Artifact Extraction and Release Builds](#202-artifact-extraction-and-release-builds)
+  - [20.3 Rust Front-End](#203-rust-front-end)
+- [21. N4950 Cross-Reference (C++23 Standard Draft)](#21-n4950-cross-reference-c23-standard-draft)
+- [22. Success Criteria](#22-success-criteria)
+
+---
 
 ## 1. Executive Summary
 
 **forgecc** is a proof-of-concept incremental C++20 compiler and linker, written in Rust,
 running as a persistent daemon. Its primary goal is to dramatically reduce build times
-for large C++ codebases (target: UE5 Editor / Game) by:
+for large C++ codebases (target: Unreal Engine 5+ / Chromium) by:
 
 - **Eliminating redundant work** through fine-grained memoization at every compilation stage
 - **Persisting compilation state** across builds in a content-addressed distributed database
@@ -69,12 +116,28 @@ debugging, and distributed caching into a single daemon process**.
 - No 32-bit support, no ARM64
 - No ELF/Mach-O/DWARF (architecture allows future extension)
 - No optimization passes beyond trivial ones (dead code elimination, constant folding)
-- No standalone compiler/linker tools — everything lives inside the daemon
+- No standalone compiler — `forge-cc.exe` and the forge tool family are thin RPC
+  clients (~800 lines total) that forward to the daemon; all real work happens
+  in the daemon (see §7.3)
 - No Objective-C/OpenCL/CUDA
 - No cross-compilation
-- No LLVM IR compatibility — we define our own IR (potentially MLIR-based, see §4.6)
+- No LLVM IR for the PoC — we define our own IR for determinism and memoization
+  control; LLVM IR lowering deferred to release-mode optimization path (see §4.6b)
 - No PCH — the memoization/caching system replaces PCH transparently
-- No C++20 modules (UE5 does not use them; see §15 findings)
+- No C++20 modules (UE5 has zero usage; see §15.14)
+- No C++20 coroutines (UE5 has zero usage in Engine; see §15.14)
+- No `std::ranges` / `std::views` (UE5 has zero usage; uses custom iterators)
+- No `std::format` (UE5 has zero usage; uses `FString::Printf` / `fmt`)
+- No `std::span` (UE5 has zero usage; uses `TArrayView` / `FMemoryView`)
+- No `__fastcall` / `__vectorcall` / `__thiscall` calling conventions (zero usage)
+- No `__declspec(novtable)` / `__declspec(property)` (zero usage)
+- No WinRT / WRL support (zero usage)
+- No resource compiler (.rc) support — `forge-rc.exe` exists as a driver shim but
+  forwards to `llvm-rc` or `rc.exe` for now; native .rc compilation is deferred
+- No HLSL shader compilation — shaders are compiled by UE5's ShaderCompileWorker,
+  a completely separate pipeline outside forgecc's scope
+- No memory budget optimization — this is a PoC; memory profiling and optimization
+  come later
 
 ---
 
@@ -114,6 +177,158 @@ debugging, and distributed caching into a single daemon process**.
 8. **Runtime-first**: The primary execution model is runtime patching / JIT. The daemon
    loads and patches the target application in-memory. Generating a standalone .EXE/.DLL
    is a secondary "release" mode.
+
+---
+
+## 2b. Why a New Compiler Instead of Modifying LLVM/Clang
+
+The natural first question is: why not build forgecc's features on top of
+LLVM/Clang? Clang is an excellent, mature C++ compiler — arguably the best open-
+source C++ front-end ever built. We have deep respect for the LLVM community and
+the decades of work that went into it. Ideally, we would contribute these ideas
+directly to LLVM. This section explains why, regrettably, the specific combination
+of features forgecc needs does not fit within LLVM/Clang's current architecture
+without changes so deep that they would amount to a rewrite of core subsystems.
+
+**Prior art: projects that extended LLVM/Clang**
+
+Several teams have explored variations of this idea. Their experiences are
+instructive — not as failures, but as evidence of where the architectural
+boundaries lie:
+
+| Project | Approach | What happened |
+|---|---|---|
+| **Zapcc** (2018) | Forked Clang; kept AST/Sema in memory across TUs as a daemon | Achieved impressive 10–50x speedups, validating the daemon concept. Unfortunately, maintaining a Clang fork proved unsustainable — Zapcc fell behind upstream within ~2 years. The fork touched ~200 files across Clang's internals, making rebasing prohibitively expensive. |
+| **Cling** (CERN, 2011–present) | Built on top of Clang/LLVM as a library; interactive C++ JIT | A remarkable success story — used in production at CERN. However, the team reports that every LLVM major version upgrade requires significant porting effort (~62 files changed, ~1,300 insertions against Clang-9). The CaaS (Compiler-as-a-Service) project is working to upstream these patches, which speaks to how much effort it takes to maintain them out-of-tree. |
+| **SN-Systems pstore** (Sony, 2018–2022) | Modified LLVM's output layer to write to a content-addressed database instead of .obj files | Proved that content-addressed compilation artifacts work at scale — a key validation for forgecc's approach. The project was eventually discontinued; the modifications were difficult to maintain alongside upstream LLVM evolution. |
+| **Clangd / rust-analyzer** | Built as separate tools using compiler infrastructure as libraries | Clangd works well within Clang's constraints but inherits its single-threaded, file-at-a-time model. Notably, rust-analyzer chose to reimplement parsing and type-checking independently of rustc, specifically to achieve the incrementality that rustc's architecture could not easily provide. |
+
+These projects demonstrate that LLVM/Clang is a powerful foundation, but that
+certain architectural properties — persistent daemon state, fine-grained
+memoization, intra-TU parallelism — require changes deep enough that maintaining
+them as patches or forks becomes the dominant engineering cost.
+
+**What forgecc's feature set would require inside LLVM/Clang**:
+
+1. **Content-addressed memoization at every stage** — This is the core challenge.
+   Clang's AST nodes are allocated in a `BumpPtrAllocator` with pointer identity;
+   they are not content-hashable by design. To add content-addressing, we would
+   need to either (a) serialize every AST node to compute a hash (which adds
+   overhead that could negate the memoization benefit) or (b) rework Clang's AST
+   allocation model to support structural hashing. Option (b) would touch a very
+   large number of files across `clang/AST/` and `clang/Sema/`. We would love to
+   see content-addressable AST nodes in Clang someday, but the scope of that
+   change is beyond what a single project can reasonably propose.
+
+2. **Daemon mode with persistent state** — Clang's `CompilerInstance` is designed
+   around a create-use-destroy lifecycle for each TU. Global state
+   (IdentifierTable, SourceManager, Preprocessor) is not designed to be reused
+   across compilations. Zapcc demonstrated that this can be made to work, but
+   the cleanup logic required careful handling of Clang internals that change
+   with each upstream release. The CaaS project at CERN is making progress on
+   upstreaming incremental compilation support (IncrementalAction, persistent
+   CompilerInstance), which is encouraging — but even their scope is narrower
+   than what forgecc needs (they focus on interactive REPL, not full build-system
+   integration with cross-build caching).
+
+3. **Fine-grained parallelism within a TU** — Clang's Sema is single-threaded
+   per TU, which is a reasonable design choice for a traditional compiler. Sema
+   uses mutable state extensively (`Sema::CurContext`, `Sema::ExprEvalContexts`,
+   delayed diagnostics). Making Sema thread-safe would require reworking most of
+   `lib/Sema/` (~180,000 lines) — a change so large that it would effectively be
+   a new Sema. This is not a criticism of Clang's design; single-threaded Sema
+   is the right trade-off for a general-purpose compiler. forgecc's different
+   trade-off (daemon with warm caches) makes intra-TU parallelism more valuable.
+
+4. **Deterministic output for memoization** — Clang emits LLVM IR, which has
+   sources of non-determinism described in §4.6b (sequential metadata IDs,
+   emission-order-dependent value numbering). These are not bugs — they are
+   consequences of LLVM IR's design, which optimizes for compilation speed rather
+   than output reproducibility. Fixing this would require canonicalization passes
+   in `llvm/lib/IR/` and `llvm/lib/Bitcode/`, touching ~50+ files. Some of these
+   changes might be upstreamable (deterministic output is valuable for build
+   reproducibility in general), and we would be happy to contribute them if the
+   LLVM community is interested.
+
+5. **JIT execution with runtime patching** — This is where LLVM is closest to
+   forgecc's vision. ORC JIT already provides impressive infrastructure:
+   COFF/x86-64 JIT linking, SEH frame support, function redirection via
+   atomically-rewritable stubs, a re-optimization layer, out-of-process
+   execution, and lazy compilation. forgecc's JIT concept is directly informed
+   by ORC's design. The remaining gaps are the DAP debug server, native Windows
+   TLS (ORC currently uses emulated TLS), build-system daemon integration, and
+   — most importantly — content-addressed memoization. The JIT in forgecc is
+   tightly coupled to the memoization system: every JIT'd function must be
+   content-addressed, cached, and distributable. Integrating this into ORC would
+   require either feeding it pre-built .obj files (reducing ORC to just a linker)
+   or modifying ORC's internals to work with our store. Instead, forgecc builds
+   a simpler, purpose-built runtime loader (~3,000 lines) that consumes sections
+   directly from the content-addressed store, using ORC as a reference
+   implementation for the hard parts (relocation application, SEH registration,
+   TLS setup).
+
+6. **Distributed P2P caching** — This is entirely new functionality that does not
+   exist in LLVM. It would be a pure addition, but it needs deep integration with
+   the content-addressed store (point 1), which itself requires the architectural
+   changes described above.
+
+**Estimated scope of LLVM/Clang modifications**:
+
+| Change | Estimated files touched | Complexity |
+|---|---|---|
+| Content-hashable AST | ~500+ files in `clang/AST/`, `clang/Sema/` | Very high — fundamental data structure redesign |
+| Daemon mode (persistent state) | ~100+ files (Zapcc touched ~200) | High — CaaS project is making progress but scope is narrower |
+| Intra-TU parallelism | ~300+ files in `clang/Sema/` | Very high — Sema's threading model is deeply embedded |
+| LLVM IR determinism fixes | ~50+ files in `llvm/lib/IR/`, `llvm/lib/Bitcode/` | Medium — potentially upstreamable; benefits reproducible builds in general |
+| JIT + runtime patching | ~50 new files | Low — ORC provides most primitives; integration with content store is the gap |
+| P2P distributed store | ~30 new files | Low — purely additive |
+| **Total** | ~1,000+ files modified in a ~3M LoC codebase | |
+
+**The fork maintenance challenge**: LLVM/Clang receives ~1,000 commits per week.
+A fork touching 1,000+ files would diverge from upstream within months, making it
+increasingly difficult to pull in bug fixes, new platform support, and C++ standard
+updates. Zapcc's experience illustrates this — it was a well-executed fork by an
+experienced team, and it still became impractical to maintain.
+
+**The upstreaming challenge**: We would genuinely prefer to contribute these
+features to LLVM. However, the changes forgecc needs are architectural (AST
+allocation model, Sema threading, IR determinism), not incremental. Proposing
+changes of this scope to Clang's core data structures would be a multi-year effort
+requiring broad community consensus — and rightly so, since these changes would
+affect every Clang user. The CaaS project's experience is informative: even with
+CERN's backing and a relatively modest patch set (~62 files), upstreaming
+incremental compilation support has been a years-long effort. forgecc's changes
+would be an order of magnitude larger.
+
+**What forgecc gains from a fresh start**:
+
+| Advantage | Detail |
+|---|---|
+| **Pure Rust, no C++ dependency** | Eliminates the LLVM build (10–30 min), C++ FFI complexity, and mixed-language debugging. The entire compiler is one `cargo build`. |
+| **Designed for memoization from day one** | Every data structure is content-hashable by construction. No retrofitting. |
+| **Designed for parallelism from day one** | Rust's ownership model enforces thread safety at compile time. No global mutable state in Sema. |
+| **Minimal code** | ~110K LoC for the full compiler vs. ~3M LoC for LLVM/Clang. Easier to understand, debug, and modify. |
+| **No upstream dependency** | No version tracking, no merge conflicts, no waiting for upstream reviews. |
+| **Subset targeting** | Only implement the C++ features UE5 actually uses. Clang must support everything — a much harder problem. |
+
+**What forgecc gives up — and how we mitigate it**:
+
+| Cost | Mitigation |
+|---|---|
+| **20+ years of Clang bug fixes** | `forge-verify` (§8b) continuously compares forgecc's output against Clang, catching corner-case divergences early. |
+| **Optimization pipeline** | The hybrid path (§4.6b) lowers ForgeIR → LLVM IR for release builds, reusing LLVM's full -O2/-O3 pipeline. |
+| **Platform breadth** | forgecc targets one platform (x86-64 Windows) for the PoC. The architecture supports future extension. |
+| **Community and ecosystem** | Clang has hundreds of contributors, sanitizers, static analyzers, clang-tidy, clang-format. forgecc starts without these, but the content-addressed store and daemon architecture enable new tooling patterns. |
+| **Standard compliance** | forgecc implements the C++ subset that UE5 uses, see §21. |
+
+**A hybrid path could preserve the relationship with LLVM**: The design envisions
+a possible `ForgeIR → LLVM IR` lowering path for release builds (§4.6b). If
+pursued, forgecc would not replace LLVM but rather use it as a backend for
+optimized builds — similar to how Swift (SIL → LLVM IR) and Rust (MIR → LLVM IR)
+leverage LLVM today. In that scenario, the clean break would only be in the
+front-end and the development-mode pipeline; improvements to LLVM's codegen or
+optimization passes would benefit forgecc's release builds automatically. Whether
+and when this path is implemented depends on how the project evolves.
 
 ---
 
@@ -254,6 +469,14 @@ fn memoized<I: Hash, O: Serialize + DeserializeOwned>(
 }
 ```
 
+**The fundamental memoization invariant**: For memoization to be worthwhile at any
+granularity level, the cost of computing and validating the cache key (the "signature")
+must be **significantly less** than the cost of executing the computation it guards.
+If checking the signature takes as long as just re-doing the work, the cache is
+overhead, not optimization. This invariant must hold not just on average but in the
+common case — the "change one file, rebuild" inner loop that developers hit hundreds
+of times per day. Every design decision below is evaluated against this invariant.
+
 **Granularity levels** (from coarse to fine):
 
 1. **Translation unit level**: Hash(source + all includes + flags) → full compiled output.
@@ -333,6 +556,402 @@ incrementally during lexing (macro deps, include deps), parsing (symbol deps), a
 sema (layout deps), then stored in the content-addressed store alongside the
 compilation result. Estimated cost: ~500–800 additional lines in the memoizer.
 
+#### Template Instantiation Memoization (The Hard Problem)
+
+Template instantiation memoization is one of the hardest problems in the entire
+**forgecc** design. Unlike TU-level or header-level caching where the inputs are
+relatively self-contained (source text + flags + includes), a template instantiation's
+result depends on a **large, open-ended set of contextual information** — name lookup
+results, overload resolution outcomes, ADL-discovered functions, concept satisfaction,
+SFINAE success/failure, partial specialization selection, and more. Getting this wrong
+means either **incorrect caching** (returning stale results after a change) or
+**excessive invalidation** (recomputing instantiations that haven't actually changed).
+
+##### Why this matters for UE5
+
+UE5's template-heavy code (TArray, TMap, TSet, TSharedPtr, TFunction, TDelegate,
+TVariant, TOptional, plus MSVC STL headers) means the same templates are instantiated
+across hundreds of TUs with the same or similar arguments. A single `TArray<AActor*>`
+instantiation produces ~2,000–5,000 lines of IR. If we can memoize it, we avoid
+repeating that work across every TU that uses it. The potential savings are enormous —
+but only if the signature check is fast enough.
+
+##### Exhaustive dependency list
+
+The result of instantiating a template `T<Args...>` depends on all of the following:
+
+**A. The template definition**
+
+| Dependency | Why it matters |
+|---|---|
+| Template body AST hash | Any change to the template source code |
+| Base class template definitions (recursive) | e.g. `_Compressed_pair` inside `std::vector` |
+| Default template argument expressions | `template<class T, class Alloc = allocator<T>>` |
+| Member function template bodies | Each may be instantiated on demand |
+| Friend declarations | Friends can inject names into enclosing namespaces |
+
+**B. The template arguments (deep hash)**
+
+| Dependency | Why it matters |
+|---|---|
+| Full type definition of each type argument | Layout, members, bases, virtual functions — not just the name |
+| Nested types of arguments (`T::value_type`, `T::iterator`) | Dependent name resolution |
+| Member functions of arguments | If template calls `t.foo()`, the overload set of `foo` matters |
+| Base classes of arguments | Affects member lookup, conversions, concept satisfaction |
+| Friend functions of arguments | Found via ADL |
+| NTTP values | `array<int, 5>` — the `5` is part of the key |
+| Template template argument definitions | `template<template<class> class C>` — `C`'s definition matters |
+
+**C. Two-phase name lookup results**
+
+This is the hardest category. C++ templates use two-phase lookup (N4950 §13.8):
+
+*Phase 1 — non-dependent names (resolved at template definition point):*
+
+| Dependency | Why it matters |
+|---|---|
+| Non-dependent name resolutions | Names that don't depend on `T` are resolved once when the template is first parsed |
+| Non-dependent operator overloads | `a + b` where both types are known at definition |
+| Using declarations visible at definition | `using std::swap;` |
+| Namespace-scope names visible at definition | All names from enclosing/used namespaces |
+
+*Phase 2 — dependent names (resolved at instantiation point):*
+
+| Dependency | Why it matters |
+|---|---|
+| ADL-found functions for dependent calls | `swap(a, b)` where `a` is type `T` — ADL searches `T`'s associated namespaces |
+| ADL-found operators for dependent expressions | `a == b`, `os << a` where `a` is dependent |
+| Associated namespaces of all argument types | The set of namespaces ADL searches |
+| Associated namespaces of base classes of arguments | ADL also searches base class namespaces |
+| Associated namespaces of template arguments of arguments | `vector<MyClass>` → `MyClass`'s namespace is associated |
+
+**D. Overload resolution outcomes**
+
+Every call expression involving dependent types produces an overload resolution:
+
+| Dependency | Why it matters |
+|---|---|
+| Full candidate set (all visible overloads) | Adding/removing an overload changes the winner |
+| Implicit conversion sequences for each candidate | Whether `T` is convertible to parameter types |
+| Concept constraints on candidates | Constrained candidates may become more/less viable |
+| Partial ordering of function templates | Which function template is more specialized |
+| User-defined conversion operators/constructors | `explicit`/non-`explicit` conversions |
+| Deleted functions in candidate set | A deleted overload can make the call ill-formed |
+| Default argument expressions | Affect viable candidate determination |
+
+**E. Concept satisfaction and SFINAE**
+
+| Dependency | Why it matters |
+|---|---|
+| Concept definition hashes | The concept body itself (e.g. `CSameAs`) |
+| Atomic constraint satisfaction results | Each `requires` sub-expression evaluated against `T` |
+| Nested requires-expression validity | `requires { t.foo(); }` — depends on `T::foo` existing |
+| Subsumption ordering | Which constrained overload is more constrained |
+| SFINAE substitution success/failure | `enable_if_t<is_integral_v<T>>` — depends on the trait |
+| `void_t` detection idiom results | Whether an expression is well-formed |
+| `decltype` on dependent expressions | The deduced type of `decltype(t + u)` |
+
+**F. Specialization selection**
+
+| Dependency | Why it matters |
+|---|---|
+| Set of visible partial specializations | Adding a partial spec can change which is selected |
+| Set of visible explicit specializations | An explicit spec replaces the primary template entirely |
+| Partial ordering of specializations | Which partial spec is "more specialized" |
+
+**G. Implicit special member functions**
+
+| Dependency | Why it matters |
+|---|---|
+| Defaulted/deleted status of `T`'s special members | Whether `T` is copyable, movable, destructible |
+| Trivially copyable/destructible status | Affects `memcpy` optimization, `constexpr` eligibility |
+| Aggregate status of `T` | Whether aggregate initialization applies |
+
+**H. Instantiation-point context**
+
+| Dependency | Why it matters |
+|---|---|
+| `#pragma pack` state at instantiation point | Affects layout of instantiated class templates |
+| `[[no_unique_address]]` on members | Affects class layout |
+| Compiler flags (`-D`, `-std`) | Feature-test macros, `__cplusplus` value |
+
+##### Memoization strategy: phased approach
+
+Given the complexity above, we use a **three-tier strategy** that respects the
+fundamental memoization invariant (signature cost << computation cost):
+
+**Tier 1 — Structural key (Phase 3, day one)**
+
+```rust
+struct TemplateInstantiationKey {
+    /// Hash of the template definition AST (body, bases, defaults, friends)
+    template_def_hash: Blake3Hash,
+    /// Deep hash of all template arguments (full type definitions, not just names)
+    template_args_hash: Blake3Hash,
+    /// Hash of the "instantiation context": all declarations visible in the
+    /// associated namespaces of the template arguments at the point of instantiation.
+    /// This is the conservative over-approximation that makes ADL safe.
+    instantiation_context_hash: Blake3Hash,
+    /// Active #pragma pack state, relevant compiler flags
+    context_flags_hash: Blake3Hash,
+}
+```
+
+**Cost analysis**: Computing `template_def_hash` and `template_args_hash` is cheap —
+these are hashes of AST nodes that are already in memory (or in the store) from
+earlier pipeline stages. The expensive part is `instantiation_context_hash`, which
+requires enumerating all declarations in the associated namespaces. However:
+
+- Associated namespaces are typically small (1–3 namespaces for most UE5 types)
+- The declarations in those namespaces are already parsed and hashed (from header
+  caching) — we're combining existing hashes, not re-parsing
+- We can cache the "namespace content hash" per namespace and invalidate it only
+  when a declaration is added/removed/changed in that namespace
+
+**Estimated signature cost**: ~1–5 μs per instantiation (hash lookups + combine).
+**Estimated instantiation cost**: ~50–500 μs for a typical class template (type
+checking all members, overload resolution, codegen). **Ratio: 50–500x**, well within
+the memoization invariant.
+
+**Trade-off**: This over-invalidates. Adding an unrelated function to `namespace game`
+invalidates all instantiations whose arguments have `game` as an associated namespace.
+In practice this is acceptable because (a) most UE5 types are in the global namespace
+or a small set of UE namespaces, and (b) namespace-level changes are relatively rare
+compared to function-body changes.
+
+**Tier 2 — Recorded dependency signature (Phase 7+, optimization)**
+
+During the first instantiation, **instrument** every lookup, overload resolution, and
+concept check to record exactly which external facts were consulted:
+
+```rust
+struct TemplateInstantiationSignature {
+    /// Tier 1 key (for initial lookup)
+    key: TemplateInstantiationKey,
+
+    /// Phase 1 (definition-time) name resolutions — shared across all instantiations
+    /// of the same template, computed once when the template is first parsed
+    nondependent_lookups: BTreeMap<QualifiedName, Blake3Hash>,
+
+    /// Phase 2 (instantiation-time) dependent name resolutions
+    dependent_name_resolutions: BTreeMap<QualifiedName, Blake3Hash>,
+
+    /// ADL results: (unqualified function name, argument type hashes) → winning candidate hash
+    adl_results: BTreeMap<(InternedString, Vec<Blake3Hash>), Blake3Hash>,
+
+    /// Overload resolution outcomes: call site → selected candidate hash
+    overload_winners: BTreeMap<CallSiteId, Blake3Hash>,
+
+    /// Concept satisfaction: (concept hash, argument hashes) → satisfied?
+    concept_results: BTreeMap<(Blake3Hash, Vec<Blake3Hash>), bool>,
+
+    /// SFINAE: substitution site → success/failure
+    sfinae_results: BTreeMap<SubstitutionSiteId, bool>,
+
+    /// Specialization selection: which partial/explicit spec was chosen
+    specialization_choices: BTreeMap<Blake3Hash, SpecializationChoice>,
+
+    /// Type properties queried: sizeof, alignof, is_trivially_copyable, etc.
+    type_properties: BTreeMap<Blake3Hash, TypePropertySet>,
+}
+```
+
+**Cost analysis**: On the first instantiation, recording these dependencies adds
+~10–20% overhead (an extra hash per lookup/resolution). On subsequent builds, the
+**validation** cost is: iterate the recorded dependencies, check each hash against
+the current value. This is O(number of recorded dependencies), typically 10–100
+lookups for a class template instantiation.
+
+**Estimated validation cost**: ~5–20 μs (10–100 hash comparisons).
+**Estimated re-instantiation cost**: ~50–500 μs.
+**Ratio: 5–50x**, still well within the invariant, and with far fewer false
+invalidations than Tier 1.
+
+**Key insight**: The Tier 2 signature is only computed once (during the first
+instantiation) and then stored alongside the cached result. On subsequent builds,
+we only *validate* it (check if any recorded dependency changed), which is much
+cheaper than computing it from scratch. This is analogous to how build systems
+record file dependencies during compilation and check mtimes on rebuild — the
+recording happens as a side effect of the work, not as a separate pass.
+
+**Tier 3 — Namespace content hash caching (cross-cutting optimization)**
+
+The most expensive part of Tier 1's `instantiation_context_hash` is enumerating
+associated namespaces. We optimize this with a **per-namespace content hash** that
+is maintained incrementally:
+
+```rust
+struct NamespaceContentHash {
+    /// Hash of all declaration signatures in this namespace
+    decl_hash: Blake3Hash,
+    /// Monotonic version counter — bumped on any add/remove/change
+    version: u64,
+}
+```
+
+When a header is re-parsed and a namespace gains/loses/changes a declaration, the
+namespace's content hash is updated. Template instantiation keys that reference this
+namespace can do a cheap version check (`version == cached_version`) before falling
+back to full hash comparison. This makes the common case (nothing changed in the
+namespace) essentially free — a single integer comparison.
+
+##### ADL: the specific hard case
+
+ADL is the single most dangerous dependency for memoization correctness. Consider:
+
+```cpp
+namespace game {
+    struct Actor { /* ... */ };
+}
+
+// In TU A (compiled first):
+template<class T> void process(T& x) { serialize(x); }  // ADL finds game::serialize
+void foo() { game::Actor a; process(a); }
+
+// Later, someone adds to game namespace:
+namespace game {
+    void serialize(Actor& a) { /* new implementation */ }
+}
+```
+
+Adding `game::serialize` changes the ADL result for `process<game::Actor>`. The
+memoized instantiation of `process<game::Actor>` must be invalidated.
+
+**Tier 1 handles this correctly** because `instantiation_context_hash` includes all
+declarations in `namespace game`. Adding `serialize` changes the hash.
+
+**Tier 2 handles this precisely** because `adl_results` records that the call to
+`serialize(x)` resolved to a specific candidate (or failed). On rebuild, we check
+whether the same unqualified lookup with the same argument types still produces the
+same winner.
+
+**Worst case for ADL**: Types in the global namespace. The global namespace can
+contain thousands of declarations, making the namespace content hash expensive to
+compute. Mitigation: for the global namespace specifically, we partition the content
+hash by declaration name prefix or use a Merkle tree structure so that adding one
+function only invalidates the relevant subtree.
+
+##### Signature cost budget
+
+To maintain the memoization invariant, we enforce these cost budgets:
+
+| Granularity | Max signature cost | Typical computation cost | Min ratio |
+|---|---|---|---|
+| TU level | ~100 μs (hash source + includes) | ~100–500 ms (full compile) | 1000x |
+| Header level | ~10–50 μs (hash content + macro state) | ~1–10 ms (parse + type-check) | 50x |
+| Function level | ~1–5 μs (hash AST + type context) | ~10–100 μs (IR + codegen) | 10x |
+| Template instantiation (Tier 1) | ~1–5 μs (combine existing hashes) | ~50–500 μs (full instantiation) | 50x |
+| Template instantiation (Tier 2) | ~5–20 μs (validate recorded deps) | ~50–500 μs (full instantiation) | 5x |
+
+If profiling shows a granularity level violating its ratio, we either (a) make the
+signature cheaper (coarser hash, fewer deps checked), or (b) drop to a coarser
+granularity level for that case. The system must **never** spend more time checking
+the cache than it would spend just doing the work.
+
+**Escape hatch**: For pathological cases (deeply nested template instantiations,
+templates with hundreds of dependent calls, types in the global namespace with
+thousands of declarations), the memoizer falls back to Tier 1 or even TU-level
+caching. The instrumentation in Tier 2 can detect when the dependency set is
+growing too large and abort recording, falling back to the structural key.
+
+##### Implementation plan
+
+- **Phase 3** (Sema): Implement Tier 1 (structural key). This is sufficient for
+  correctness and provides significant speedup for the common case.
+- **Phase 7+** (Optimization): Implement Tier 2 (recorded signatures) for the
+  most-instantiated templates. Profile first to identify which templates benefit most.
+- **Ongoing**: Implement Tier 3 (namespace content hash caching) as a cross-cutting
+  optimization that benefits all tiers.
+
+Estimated cost: ~1,500 lines for Tier 1, ~2,500 lines for Tier 2, ~500 lines for
+Tier 3. Total: ~4,500 lines across `forge-sema` and `forge-store`.
+
+#### Forward Memoization vs. Query-Based Incrementality (salsa-rs)
+
+forgecc uses **forward (push-based) memoization**: the pipeline runs stages in
+order (lex → preprocess → parse → sema → IR → codegen), each stage hashes its
+inputs, checks the content-addressed store, and either returns a cached result or
+computes and stores a new one. This is a fundamentally different model from
+**query-based (pull-based) incrementality** as implemented by
+[salsa-rs](https://github.com/salsa-rs/salsa), which powers rust-analyzer.
+
+**How salsa works**: The program is expressed as a graph of tracked functions
+(queries). Each query declares its dependencies implicitly — salsa records which
+other queries it called during execution. When an input changes, salsa walks the
+dependency graph top-down using a "red-green" algorithm: it marks potentially
+affected queries as "red" (may need re-execution), then verifies each by checking
+whether its recorded dependencies actually changed. If a query's inputs are
+unchanged (or changed but produced the same output — "backdating"), the query
+stays "green" and its cached result is reused. Execution is demand-driven: nothing
+runs until a root query is requested.
+
+| | Forward Memoization (forgecc) | Query-Based (salsa-rs) |
+|---|---|---|
+| **Execution model** | Push: pipeline runs stages in fixed order | Pull: queries execute on demand, top-down |
+| **Dependency tracking** | Explicit: each stage declares its input hash upfront | Implicit: salsa records dependencies during execution |
+| **Granularity control** | Manual: we choose granularity levels (TU, header, function, template) | Automatic: every tracked function is a memoization point |
+| **Cache key** | Content hash of inputs (blake3) | Revision counter + dependency graph walk |
+| **Invalidation** | Content-based: if the hash matches, the result is valid regardless of history | Revision-based: if any transitive input's revision changed, re-verify |
+| **Determinism** | Guaranteed: same inputs → same hash → same result, always | Guaranteed within a session; cross-session requires careful input identity |
+| **Distribution** | Natural: content hashes are globally unique, any peer can serve a cached result | Hard: revision numbers are local to a single database instance |
+| **Persistence** | Natural: content-addressed store is inherently persistent and shareable | Possible but not native; salsa's database is in-memory, persistence requires serialization |
+| **Parallelism** | Coarse: stages run in parallel across TUs; within a TU, pipeline is sequential | Fine: salsa supports concurrent query execution with cycle detection |
+| **Overhead per cache check** | ~1–5 μs (hash lookup in store) | ~0.1–1 μs (revision comparison, no hashing) |
+| **Overhead per cache miss** | Hash computation + store write (~5–20 μs) | Execution + dependency recording (~1–5 μs recording overhead) |
+| **False re-executions** | Low: content-based — if the output bytes are identical, it's a hit | Lower: backdating means even if an input changed, if the output didn't, downstream stays green |
+| **Incremental precision** | Depends on granularity tier chosen (Tier 1 over-invalidates, Tier 2 is precise) | High: automatic fine-grained tracking of every query dependency |
+| **Code complexity** | Lower: each stage is a standalone function with explicit hash-in/hash-out | Higher: requires structuring the entire program as tracked queries with a database |
+| **Bootstrapping cost** | Low: works with any function signature | Moderate: requires salsa macros, database setup, tracked struct definitions |
+
+**Why forgecc uses forward memoization instead of salsa**:
+
+1. **Distribution is the killer feature.** Content hashes are globally meaningful —
+   if machine A computes `blake3(inputs) → result`, machine B can use that result
+   without knowing anything about machine A's revision history. salsa's revision
+   numbers are local to a single database instance. Making salsa distributed would
+   require mapping local revisions to content hashes anyway, at which point we've
+   rebuilt forward memoization on top of salsa.
+
+2. **Persistence is free.** The content-addressed store is inherently persistent —
+   shut down the daemon, restart it, and all cached results are still valid because
+   they're keyed by content, not by ephemeral revision numbers. salsa's database
+   is in-memory; persisting it requires serializing the entire dependency graph and
+   re-validating it on reload (since file contents may have changed while the
+   process was down).
+
+3. **C++ compilation is coarse-grained enough.** salsa shines when the computation
+   graph has thousands of fine-grained interdependent queries (like rust-analyzer's
+   type inference, where changing one function signature can ripple through hundreds
+   of call sites). C++ compilation is more pipeline-shaped: lex → preprocess →
+   parse → sema → IR → codegen. The natural memoization points (TU, header,
+   function, template instantiation) are well-defined and relatively few per TU.
+   The overhead of salsa's automatic dependency tracking doesn't pay for itself
+   when the granularity is already coarse.
+
+4. **Backdating is less valuable for C++.** salsa's backdating (detecting that a
+   re-executed query produced the same output as before) is powerful for IDE
+   scenarios where the user is typing and most keystrokes don't change the semantic
+   result. forgecc targets batch compilation where inputs change between builds,
+   not keystroke-by-keystroke. Our content-based approach achieves the same effect:
+   if the output hash is the same, downstream stages see no change.
+
+5. **Simpler mental model.** Each pipeline stage is a pure function:
+   `hash(inputs) → check store → compute or return cached`. There is no global
+   dependency graph to reason about, no cycle detection, no revision bookkeeping.
+   This makes the system easier to debug, profile, and extend.
+
+**Where salsa would win**: If forgecc ever adds an IDE mode (language server),
+salsa's demand-driven model with fine-grained invalidation would be superior for
+interactive use cases. The architecture does not preclude adding a salsa-based
+layer on top of the content-addressed store for IDE features — salsa queries could
+use the store as their backing cache, getting the best of both worlds.
+
+**Cost comparison**: Forward memoization adds ~500–800 lines to the memoizer
+(§4.2). A salsa-based approach would require restructuring the entire pipeline
+into tracked queries (~2,000–3,000 lines of boilerplate) plus the salsa dependency
+itself. The forward approach is smaller, simpler, and directly supports the
+distributed use case that is core to forgecc's value proposition.
+
 ### 4.3 Lexer & Preprocessor
 
 The lexer and preprocessor are tightly coupled in C++ because the preprocessor operates
@@ -341,6 +960,16 @@ on tokens, and macro expansion can produce new tokens.
 **Key design decisions**:
 
 - **Lazy lexing**: Lex on demand as the preprocessor or parser requests tokens.
+- **Phases of translation (N4950 §5.2)**: The lexer implements the standard's phases:
+  - **Phase 1**: UTF-8 input decoding, CR/CRLF → LF normalization, BOM (`U+FEFF`)
+    stripping at start of file
+  - **Phase 2**: Backslash-newline line splicing (must be reverted inside raw string
+    literals per the standard)
+  - **Phase 3**: Decomposition into preprocessing tokens and whitespace
+  - **Phase 5–6**: Adjacent string literal concatenation with encoding prefix
+    compatibility checking (e.g., `u8"a" "b"` → `u8"ab"`, but `u"a" U"b"` is
+    ill-formed). This includes user-defined string literal concatenation where
+    `ud-suffix`es must match.
 - **Include-once optimization**: Track `#pragma once` and include guards. If header
   content hash unchanged, skip re-lexing entirely.
 - **Automatic header caching**: Any header's **fully parsed and type-checked result**
@@ -349,20 +978,65 @@ on tokens, and macro expansion can produce new tokens.
   than traditional PCH. The key difference from PCH: the cache is per-header (not
   per-project), keyed by content + macro state, and requires zero user configuration.
 
-**Preprocessor features needed** (based on UE5/Game codebase analysis):
+**Literal support** (N4950 §5.13):
+
+- **Integer literals**: decimal, octal, hex, binary; digit separators (`1'000'000`);
+  suffixes `u`/`U`, `l`/`L`, `ll`/`LL`, `z`/`Z` (C++23 `size_t` suffix — needed
+  for MSVC STL headers)
+- **Floating-point literals**: decimal and **hexadecimal** (`0xC.68p+2`); digit
+  separators; suffixes `f`/`F`, `l`/`L`; extended float suffixes (`f16`, `f32`,
+  `f64`, `f128`, `bf16`) recognized but treated as conditionally-unsupported
+- **Character literals**: all encoding prefixes (`u8`, `u`, `U`, `L`); escape
+  sequences (simple, octal, hex, `\u`, `\U`, `\N{name}`, `\o{}`/`\x{}`);
+  multicharacter literals
+- **String literals**: all encoding prefixes; **raw string literals** (`R"delim(...)delim"`)
+  with special lexer handling (line splicing reverted, delimiter matching); adjacent
+  string concatenation (phase 5–6)
+- **User-defined literals** (N4950 §5.13.8): `ud-suffix` recognition for integer,
+  floating-point, string, and character literals (e.g., `123_km`, `"hello"s`,
+  `100ms`). The lexer produces a `UserDefinedLiteral` token; Sema resolves it as a
+  call to `operator""` (see §4.5 overload module)
+- **Boolean literals**: `true`, `false`
+- **Pointer literal**: `nullptr`
+
+**Preprocessor features needed** (based on UE5/Game codebase analysis + N4950 §15):
 
 - `#include` / `#include_next`
 - `#define` / `#undef` (object-like and function-like macros, variadic)
-- `#if` / `#ifdef` / `#ifndef` / `#elif` / `#else` / `#endif`
+- `#if` / `#ifdef` / `#ifndef` / `#elif` / `#elifdef` / `#elifndef` / `#else` / `#endif`
 - `#pragma once`, `#pragma push_macro`, `#pragma pop_macro`
 - `#pragma comment(lib, ...)`, `#pragma comment(linker, ...)`
+- `#pragma pack(push, N)`, `#pragma pack(pop)`, `#pragma pack(N)` — **critical** for
+  MSVC struct layout compatibility; heavily used in UE5 and MSVC STL headers
+- `#pragma warning(push)`, `#pragma warning(pop)`, `#pragma warning(disable: N)` —
+  heavily used in UE5 and MSVC STL headers to suppress warnings
+- `#line` (N4950 §15.7) — used by code generators including UHT-generated `.gen.cpp`
+- `#error` (N4950 §15.8) — used in UE5 headers for platform/config validation
+- `#warning` — non-standard but supported by MSVC and clang-cl
+- Null directive `#` (bare `#` on a line, N4950 §15.10)
 - `__has_include`, `__has_cpp_attribute`
+- `__has_builtin` — clang extension, queried by MSVC STL and UE5 headers to detect
+  compiler built-in availability (e.g., `__has_builtin(__builtin_addressof)`)
+- `__has_feature`, `__has_extension` — clang extensions, queried by third-party headers
+  and some UE5 code for feature detection
 - `_Pragma`
 - `__VA_ARGS__`, `__VA_OPT__`
 - `__FILE__`, `__LINE__`, `__COUNTER__`, `__FUNCTION__`, `__FUNCSIG__`
 - MSVC-specific: `__declspec(...)`, `__forceinline`, `__pragma`
 - UE-specific: `UCLASS()`, `UPROPERTY()`, `GENERATED_BODY()` — standard macros, but
   the compiler must handle UHT annotations without issues
+
+**Predefined macros** (N4950 §15.11 + MSVC/clang-cl extensions):
+
+- Standard: `__cplusplus` (must be `202002L` for C++20), `__STDC_HOSTED__`,
+  `__STDCPP_DEFAULT_NEW_ALIGNMENT__`, `__STDCPP_THREADS__`
+- Feature-test macros: `__cpp_concepts`, `__cpp_consteval`, `__cpp_designated_initializers`,
+  `__cpp_structured_bindings`, `__cpp_three_way_comparison`, `__cpp_if_constexpr`,
+  `__cpp_fold_expressions`, `__cpp_deduction_guides`, etc. — queried by MSVC STL
+  headers via `#if __cpp_lib_*` / `#if __cpp_*` to enable/disable features
+- MSVC-specific: `_MSC_VER`, `_MSC_FULL_VER`, `_MSVC_LANG`, `_WIN32`, `_WIN64`,
+  `_M_X64`, `_M_AMD64`, `_DEBUG` / `NDEBUG`
+- Clang-cl-specific: `__clang__`, `__clang_major__`, `__clang_minor__`
 
 **C language support**: The preprocessor and lexer must handle both C and C++ modes.
 Based on our analysis, UE5's Engine/Source/ThirdParty contains **4,335 .c files**
@@ -380,31 +1054,72 @@ parsing context for everything that follows. This means the parser must process
 top-level declarations in order — there is no practical way to parallelize C++ parsing
 within a single file. (Parallelism across TUs is unaffected.)
 
-**C++20 features needed** (based on UE5/Game codebase analysis):
+**C++20 features needed** (based on UE5/Game codebase analysis + N4950 cross-reference):
 
 - Classes, structs, unions, enums (including `enum class`)
+- **Bit-fields** — used in UE5 for flags, compact representations; affects parser
+  (member-declarator with `:` width), Sema (layout computation), and codegen
+- **Non-static data member initializers (NSDMI)** — default member initializers
+  (`int x = 42;` in class body); heavily used in UE5
 - Templates (class, function, variable, alias templates)
+- **Template template parameters** — used in MSVC STL headers
 - Template specialization (partial and full)
+- **Explicit template instantiation** (`template class X<int>;`) and **`extern template`**
+  (`extern template class X<int>;`) — used in UE5 Core for compile-time control
+  (StringFormatter, TokenStream, SizedHeapAllocator for ANSICHAR/WIDECHAR)
+- **Class template argument deduction (CTAD)** and deduction guides (N4950 §13.3.1) —
+  used in MSVC STL (`std::vector v = {1, 2, 3};`, `std::pair p = {1, "hello"};`);
+  requires parsing deduction-guide declarations and synthesizing deduction candidates
 - **Concepts and requires-clauses** — UE5 uses these! Found in `Core/Public/Concepts/`
   (`CSameAs`, `CDerivedFrom`, `CConvertibleTo`, etc.), `MassEntity`, `CoreUObject`,
   `TypedElementFramework`, and many more. ~200+ files with concept/requires usage.
 - Lambdas (including generic lambdas, init-capture)
-- `constexpr` / `constinit`
-- `consteval` — used in D3D12RHI, VerseVM, CoreUObject (~20 files)
-- Structured bindings
-- `if constexpr`
+- `constexpr` / `constinit` / `consteval`
+  - `constinit` (N4950 §9.2.1) — guarantees constant initialization of variables;
+    used for static initialization safety
+  - `consteval` — used in D3D12RHI, VerseVM, CoreUObject (~20 files)
+- Structured bindings (N4950 §9.6)
+- `if constexpr` / `if consteval` (N4950 §8.5.2)
 - Fold expressions
 - Designated initializers
+- **Aggregate initialization** including C++20 parenthesized aggregate init
+  (`T(args...)` for aggregates)
+- **Brace-enclosed initializer lists** / `std::initializer_list` construction —
+  complex rules for narrowing conversions, brace elision, copy-list-init vs.
+  direct-list-init (N4950 §9.4.5)
 - Three-way comparison (`<=>`) — used in abseil, D3D12RHI
+- **Defaulted comparison operators** (`= default` for `operator==` and `operator<=>`,
+  N4950 §11.10) — compiler must synthesize member-wise comparison logic
 - `using enum`
-- Attributes (`[[nodiscard]]`, `[[likely]]`, `[[no_unique_address]]`, etc.)
-- MSVC extensions: `__declspec`, `__forceinline`, `__int64`, SEH (`__try/__except/__finally`)
+- `static_assert` with optional message (N4950 §9.1)
+- `alignas` / `alignof` (N4950 §9.12.2) — used in UE5 for SIMD alignment
+- **`extern "C"` / linkage specifications** (N4950 §9.11) — used extensively in UE5
+  for C interop and DLL exports; affects name mangling and calling conventions
+- **`explicit(bool)`** conditional explicit (N4950 §9.2.3) — `explicit(condition)`
+  where condition is a constant expression; used in MSVC STL headers (`std::pair`,
+  `std::tuple`, `std::optional` constructors)
+- **`noexcept` specifier and operator** (N4950 §14.5, §7.6.2.7) — `noexcept` is part
+  of the function type in C++17+; affects overload resolution and type system
+- **`typeid` and RTTI** — `dynamic_cast`, `typeid` used in some UE5 paths; requires
+  vtable RTTI info generation
+- Attributes (`[[nodiscard]]`, `[[nodiscard("reason")]]`, `[[likely]]`,
+  `[[unlikely]]`, `[[no_unique_address]]`, `[[deprecated("msg")]]`,
+  `[[fallthrough]]`, `[[maybe_unused]]`) — attribute argument parsing needed for
+  string-argument attributes
+- **User-defined literals** — parser must recognize `ud-suffix` on literals (see §4.3)
+- MSVC extensions: `__declspec`, `__forceinline`, `__int64`, SEH (`__try/__except/__finally`),
+  `__uuidof` (COM interface identification, ~70 files), `__assume` (optimizer hint),
+  `_alloca` (stack allocation)
 - C language parsing mode (for .c files)
 
-**NOT needed** (confirmed from codebase analysis):
-- Coroutines (`co_await`, `co_yield`, `co_return`) — **zero** occurrences found in
-  Engine/Source/Runtime
-- C++20 modules (`export module`, `import`) — **zero** occurrences found
+**NOT needed** (confirmed from UE5 codebase scan — see §15.14):
+- Coroutines (`co_await`, `co_yield`, `co_return`) — **zero** occurrences in Engine
+- C++20 modules (`export module`, `import`) — **zero** occurrences
+- `std::ranges` / `std::views` — **zero** occurrences (UE uses custom iterators)
+- `std::format` — **zero** occurrences (UE uses `FString::Printf` / `fmt`)
+- `std::span` — **zero** occurrences (UE uses `TArrayView` / `FMemoryView`)
+- `__fastcall` / `__vectorcall` / `__thiscall` — **zero** occurrences
+- `__declspec(novtable)` / `__declspec(property)` — **zero** occurrences
 
 ### 4.5 Semantic Analysis (Modular Design)
 
@@ -427,27 +1142,43 @@ forge-sema/
 │   │   ├── unqualified.rs  # Unqualified name lookup
 │   │   ├── qualified.rs    # Qualified name lookup (::)
 │   │   ├── adl.rs          # Argument-dependent lookup
-│   │   └── using.rs        # Using declarations/directives
+│   │   ├── using.rs        # Using declarations/directives
+│   │   └── two_phase.rs    # Two-phase name lookup for templates (N4950 §13.8):
+│   │                       #   non-dependent names resolved at definition,
+│   │                       #   dependent names resolved at instantiation
 │   │
 │   ├── types/              # Type system
 │   │   ├── mod.rs
 │   │   ├── repr.rs         # Type representation (~500 lines max)
 │   │   ├── equivalence.rs  # Type comparison, compatibility
-│   │   ├── conversion.rs   # Implicit/explicit conversions
-│   │   ├── deduction.rs    # Template argument deduction, auto
-│   │   └── qualifiers.rs   # const, volatile, ref qualifiers
+│   │   ├── conversion.rs   # Implicit/explicit conversions, narrowing detection
+│   │   ├── deduction.rs    # Template argument deduction, auto, CTAD
+│   │   ├── qualifiers.rs   # const, volatile, ref qualifiers
+│   │   └── noexcept.rs     # noexcept as part of function type (C++17+),
+│   │                       #   noexcept operator evaluation (N4950 §7.6.2.7)
 │   │
 │   ├── overload/           # Overload resolution
 │   │   ├── mod.rs
-│   │   ├── candidates.rs   # Candidate set construction
+│   │   ├── candidates.rs   # Candidate set construction (including built-in
+│   │   │                   #   operator candidates per N4950 §12.5)
 │   │   ├── ranking.rs      # Implicit conversion ranking
-│   │   └── resolution.rs   # Best viable function selection
+│   │   ├── resolution.rs   # Best viable function selection
+│   │   ├── literals.rs     # User-defined literal operator resolution:
+│   │   │                   #   literal-operator-id lookup, literal operator
+│   │   │                   #   templates (N4950 §12.6)
+│   │   └── address_of.rs   # Address of overloaded function (N4950 §12.3)
 │   │
 │   ├── templates/          # Template instantiation
 │   │   ├── mod.rs
 │   │   ├── instantiate.rs  # On-demand instantiation with memoization
+│   │   │                   #   (class, function, variable, alias templates)
 │   │   ├── specialize.rs   # Partial/full specialization matching
-│   │   └── sfinae.rs       # Substitution failure handling
+│   │   ├── sfinae.rs       # Substitution failure handling
+│   │   ├── ctad.rs         # Class template argument deduction (N4950 §13.3.1):
+│   │   │                   #   deduction guide synthesis, implicit guides from
+│   │   │                   #   constructors, aggregate deduction guides (C++20)
+│   │   └── nttp.rs         # Non-type template parameters: class-type NTTPs
+│   │                       #   (C++20 structural types), template template params
 │   │
 │   ├── concepts/           # C++20 concepts
 │   │   ├── mod.rs
@@ -458,35 +1189,63 @@ forge-sema/
 │   │   ├── mod.rs          # evaluate_constexpr(expr) -> Value
 │   │   ├── compiler.rs     # Drives IR lowering + codegen for consteval functions
 │   │   ├── sandbox.rs      # Memory sandbox (custom allocator, UB detection)
-│   │   └── builtins.rs     # Compiler built-in constexpr functions (__builtin_*)
+│   │   └── builtins.rs     # Compiler built-in constexpr functions:
+│   │                       #   __builtin_is_constant_evaluated() (used by UE5
+│   │                       #   via UE_IF_CONSTEVAL), __builtin_addressof,
+│   │                       #   __builtin_unreachable, __builtin_expect
 │   │
 │   ├── decl/               # Declaration processing
 │   │   ├── mod.rs
-│   │   ├── variables.rs
-│   │   ├── functions.rs
-│   │   ├── classes.rs
+│   │   ├── variables.rs    # Including constinit validation
+│   │   ├── functions.rs    # Including explicit(bool), noexcept spec
+│   │   ├── classes.rs      # Including bit-fields, NSDMI, aggregate detection
 │   │   ├── enums.rs
-│   │   └── namespaces.rs
+│   │   ├── namespaces.rs
+│   │   ├── linkage.rs      # extern "C" / linkage specifications (N4950 §9.11):
+│   │   │                   #   affects name mangling and calling conventions
+│   │   └── static_assert.rs # static_assert with optional message
 │   │
 │   ├── expr/               # Expression type-checking
 │   │   ├── mod.rs
-│   │   ├── binary.rs
-│   │   ├── unary.rs
+│   │   ├── binary.rs       # Including three-way comparison (<=>)
+│   │   ├── unary.rs        # Including alignof, sizeof, noexcept operator, typeid
 │   │   ├── call.rs
 │   │   ├── member.rs
-│   │   ├── cast.rs
-│   │   └── lambda.rs
+│   │   ├── cast.rs         # Including dynamic_cast (requires RTTI)
+│   │   ├── lambda.rs
+│   │   └── init.rs         # Brace-enclosed init lists, std::initializer_list
+│   │                       #   construction, narrowing checks, brace elision
 │   │
 │   ├── stmt/               # Statement checking
 │   │   ├── mod.rs
 │   │   └── control_flow.rs
 │   │
+│   ├── bindings.rs         # Structured binding declarations (N4950 §9.6):
+│   │                       #   tuple-like (std::tuple_size/get<>), array, and
+│   │                       #   data member decomposition
+│   │
+│   ├── comparisons.rs      # Defaulted comparison operators (N4950 §11.10):
+│   │                       #   synthesize member-wise ==, <=>, rewrite rules
+│   │
+│   ├── rtti.rs             # RTTI support: typeid, dynamic_cast, vtable RTTI
+│   │                       #   info generation
+│   │
 │   ├── msvc/               # MSVC-specific
 │   │   ├── mod.rs
-│   │   ├── layout.rs       # MSVC class layout computation
+│   │   ├── layout.rs       # MSVC class layout computation (including
+│   │   │                   #   #pragma pack effects, __declspec(align),
+│   │   │                   #   __declspec(empty_bases))
 │   │   ├── mangle.rs       # Microsoft name mangling
 │   │   ├── seh.rs          # SEH __try/__except/__finally
-│   │   └── abi.rs          # Calling conventions, vtable layout
+│   │   ├── abi.rs          # Calling conventions (__cdecl, __stdcall),
+│   │   │                   #   vtable layout, COM (__uuidof)
+│   │   ├── declspec.rs     # __declspec variants: dllexport/dllimport,
+│   │   │                   #   noinline, thread, selectany, noreturn,
+│   │   │                   #   allocate, restrict, safebuffers, code_seg
+│   │   └── intrinsics.rs   # MSVC compiler intrinsics: _BitScanForward/Reverse,
+│   │                       #   _InterlockedCompareExchange*, __debugbreak,
+│   │                       #   _ReturnAddress, __cpuid, _byteswap_*,
+│   │                       #   __assume, _alloca
 │   │
 │   └── access.rs           # Access control (public/private/protected/friend)
 ```
@@ -628,30 +1387,61 @@ report a compile error.
 `consteval` function is called with the same arguments in a different TU, the result
 is reused without re-execution.
 
-### 4.6b ForgeIR — Intermediate Representation (MLIR Consideration)
+### 4.6b ForgeIR — Intermediate Representation
 
-**Should we use MLIR?**
+**forgecc uses a custom SSA-based IR (ForgeIR)**, not MLIR or LLVM IR. Here is why,
+and how the alternatives compare:
 
-MLIR (Multi-Level IR) is worth serious consideration. Pros and cons:
+| | Custom ForgeIR | MLIR-based | LLVM IR |
+|---|---|---|---|
+| **Simplicity** | Simpler to start | More infrastructure upfront | Moderate — well-documented but large spec |
+| **Extensibility** | Must build everything | Dialects, passes, transformations for free | Fixed instruction set; extending requires forking |
+| **Parallelism** | Must implement | MLIR has parallel pass infrastructure | No built-in parallel pass infrastructure |
+| **Optimization** | Must build pass manager | Can leverage existing MLIR passes | Full LLVM optimization pipeline available |
+| **Debugging** | Must build printer/verifier | Built-in verification, printing, testing | Mature tools: `llvm-dis`, `opt`, `llc`, verifier |
+| **Code size** | Smaller | Larger (MLIR dependency) | Large (LLVM dependency — millions of LoC) |
+| **Rust interop** | Native | FFI to C++ MLIR libraries (or Rust MLIR bindings) | FFI to C++ LLVM (`inkwell` / `llvm-sys` crates) |
+| **Memoization** | Full control over hashing and serialization | Full control | **Hard** — non-deterministic metadata IDs, pointer identity, global numbering make content-addressing difficult |
+| **Determinism** | Full control over ordering | Full control | **Difficult** — many sources of non-determinism (metadata `!0`/`!1` numbering, type uniquing, unnamed value `%0`/`%1` sequencing depend on emission order) |
+| **Incremental granularity** | Function-level (our design) | Function-level (our design) | **Module-level** — LLVM's unit of compilation is a `Module`; splitting below module level is non-trivial |
+| **JIT** | Must build loader | Must build loader | **LLVM ORC JIT available** — mature, handles relocations, exception tables, TLS |
+| **Codegen quality (-O0)** | Our codegen (sufficient) | Our codegen (sufficient) | LLVM's codegen (higher quality but overkill for -O0) |
+| **Codegen quality (-O2+)** | Not available | Not available | **Full LLVM optimization pipeline** — critical for release builds |
+| **SIMD intrinsics** | Must map each intrinsic manually | Must map each intrinsic | **All x86 SIMD intrinsics already defined** in LLVM IR |
+| **Build complexity** | Pure Rust, no external deps | C++ FFI, LLVM/MLIR build | C++ FFI, full LLVM build (~10–30 min) |
 
-| | Custom ForgeIR | MLIR-based |
-|---|---|---|
-| **Simplicity** | Simpler to start | More infrastructure upfront |
-| **Extensibility** | Must build everything | Dialects, passes, transformations for free |
-| **Parallelism** | Must implement | MLIR has parallel pass infrastructure |
-| **Optimization** | Must build pass manager | Can leverage existing MLIR passes |
-| **Debugging** | Must build printer/verifier | Built-in verification, printing, testing |
-| **Code size** | Smaller | Larger (MLIR dependency) |
-| **Rust interop** | Native | FFI to C++ MLIR libraries (or Rust MLIR bindings) |
+**Why not LLVM IR**: LLVM IR conflicts with forgecc's two core differentiators:
 
-**Recommendation**: Start with a **simple custom ForgeIR** for the PoC. The IR is
-SSA-based, typed, with explicit control flow. If we later need more sophisticated
-transformations, we can lower to MLIR or adopt MLIR dialects. The key reason: MLIR
-is a C++ library, and adding a C++ dependency to a Rust project adds significant
-build complexity. For the PoC, keeping everything in pure Rust is more pragmatic.
+1. **Memoization**: LLVM IR assigns sequential numeric IDs to unnamed values
+   (`%0`, `%1`, ...) and metadata nodes (`!0`, `!1`, ...). These IDs depend on
+   emission order, which can vary. Our content-addressed store requires
+   byte-identical output for identical inputs — LLVM IR makes this hard to
+   guarantee without careful canonicalization.
 
-However, we should **design ForgeIR to be MLIR-compatible** — use similar concepts
-(operations, regions, blocks) so that migration is straightforward if needed.
+2. **Fine-grained incrementality**: LLVM's unit of compilation is a `Module`.
+   Memoizing at function level (which is what makes forgecc fast on incremental
+   rebuilds) requires splitting/merging LLVM modules per function — this adds
+   significant complexity and fights LLVM's design.
+
+LLVM IR does give us a mature JIT (ORC), all SIMD intrinsics for free, and
+production-quality codegen for release builds. We capture these benefits through
+the **hybrid path** described below, without giving up control over the dev pipeline.
+
+**Why not MLIR**: MLIR is a C++ library. Adding a C++ dependency to a Rust project
+adds significant build complexity. MLIR's abstractions (dialects, passes) are
+powerful but unnecessary for the PoC — our IR is simple enough that a custom
+implementation is smaller and faster to iterate on.
+
+**Hybrid path for release builds**: ForgeIR is used for the development pipeline
+(where we need full control over determinism, memoization, and function-level
+granularity). For release builds with -O2+ optimizations, ForgeIR lowers to
+LLVM IR to leverage the full LLVM optimization pipeline. This is the same pattern
+used by Swift (SIL → LLVM IR) and Rust (MIR → LLVM IR). The release-mode path:
+`ForgeIR → LLVM IR → LLVM opt → LLVM codegen → .obj`. This path is deferred —
+the PoC focuses on -O0 / JIT where our own codegen is sufficient.
+
+ForgeIR uses MLIR-compatible concepts (operations, regions, blocks) so that
+migration to MLIR is straightforward if the need arises post-PoC.
 
 **ForgeIR design**:
 
@@ -845,7 +1635,7 @@ entirely and treat everything as a single address space.
 During development, the DAP-based debugger (§4.8) provides debugging without PDB.
 This means PDB support can be deferred to a later phase.
 
-### 4.10 UBT Integration (Command-Passing Protocol)
+### 4.10 Unreal Build Tool (UBT) Integration (Command-Passing Protocol)
 
 **No MSVC shim.** Instead, **forgecc** integrates with UBT via a direct command-passing
 protocol. UBT already structures compilation as a set of `VCCompileAction` objects
@@ -912,19 +1702,24 @@ writing minimal stamp files for build system compatibility is practical at scale
 Clang-cl mode uses fewer MSVC-specific flags, has cleaner
 semantics, and maps naturally to **forgecc**'s internal representation.
 
-UBT modifications needed: A new `ForgeccToolChain.cs` that constructs `ForgeccCompileAction`
-objects and sends them to the daemon instead of spawning `cl.exe` or `clang-cl.exe`.
+UBT modifications needed: A new `ForgeccToolChain.cs` that either (a) points
+`CompilerPath` at `forge-cc.exe` (quick start — UBT spawns it like clang-cl), or
+(b) sends `ForgeccCompileAction` objects directly to the daemon via HTTP (optimized
+— bypasses process spawning). See §7.1 for details.
 
 ### 4.11 Daemon Architecture
 
 The daemon is a long-running process that owns the local store and compilation pipeline.
 
 ```
-forgecc-daemon
+forge-daemon
     │
-    ├── HTTP Server (unified protocol — serves UBT, peers, and DAP)
-    │   ├── /v1/compile      — build system submits compile actions
-    │   ├── /v1/link         — build system submits link actions
+    ├── HTTP Server (unified protocol — serves drivers, ninja, UBT, peers, DAP)
+    │   ├── /v1/compile      — compile actions (forge-cc / clang-cl equivalent)
+    │   ├── /v1/link         — link actions (forge-link / lld-link equivalent)
+    │   ├── /v1/lib          — static library actions (forge-lib / llvm-lib equivalent)
+    │   ├── /v1/rc           — resource compile actions (forge-rc / llvm-rc equivalent)
+    │   ├── /v1/ml           — assembly actions (forge-ml / llvm-ml equivalent)
     │   ├── /v1/artifact/    — content-addressed artifact get/put (local + P2P)
     │   └── /v1/peers        — peer discovery (gossip protocol)
     ├── Build Index (output path → content key, persisted in redb)
@@ -990,7 +1785,7 @@ root = "C:/src/Game"    # or auto-detected from .git / P4CONFIG
 ```
 
 All paths in the build index are stored **relative to the workspace root** (consistent
-with the determinism requirements in §17). This means the build index is portable if
+with the determinism requirements in §16). This means the build index is portable if
 the workspace moves, and different developers with different checkout paths produce
 identical content keys. One daemon per workspace — if you have two projects, you run
 two daemons.
@@ -1081,8 +1876,9 @@ head-of-line blocking on lossy networks. This matters for the internet and mobil
 on a LAN or localhost, TCP packet loss is effectively zero — QUIC's advantage
 disappears. Additionally, the Rust server-side ecosystem for HTTP/3 is less mature
 (`axum` doesn't support it natively yet), and QUIC adds complexity (TLS 1.3 is
-mandatory, UDP may be blocked by corporate firewalls). HTTP/3 could be revisited later
-if WAN-distributed builds become a use case.
+mandatory, UDP may be blocked by corporate firewalls). HTTP/3 is out of scope; if
+WAN-distributed builds become a use case post-PoC, it is a straightforward protocol
+upgrade.
 
 **Why TCP even for local IPC**: Windows implements a
 [TCP Loopback Fast Path](https://techcommunity.microsoft.com/blog/networking/windows-tcp-loopback-fast-path-is-now-on-by-default/3023562)
@@ -1096,9 +1892,9 @@ separate IPC mechanism to maintain.
 **Connection model summary**:
 
 ```
-UBT / ninja ──── 1 HTTP/2 connection ────▶ local daemon (:9473)
-                 (hundreds of concurrent       │
-                  compile streams)             │
+UBT / ninja ──── 1 HTTP/2 connection ────▶ forge-daemon (:9473)
+  (or forge-cc     (hundreds of concurrent       │
+   thin drivers)    compile/link/lib streams)    │
                                                ├── 1 HTTP/2 connection ──▶ peer A (:9473)
                                                │   (concurrent artifact   
                                                │    get/put streams)      
@@ -1155,8 +1951,11 @@ output.
 
 | Endpoint | Method | Purpose | Used by |
 |---|---|---|---|
-| `/v1/compile` | POST | Submit compile action(s) | Build system (UBT, ninja) |
-| `/v1/link` | POST | Submit link action (.obj paths resolved via build index) | Build system (UBT, ninja) |
+| `/v1/compile` | POST | Submit compile action(s) | `forge-cc.exe`, UBT, ninja |
+| `/v1/link` | POST | Submit link action (.obj paths resolved via build index) | `forge-link.exe`, UBT, ninja |
+| `/v1/lib` | POST | Submit static library creation action | `forge-lib.exe`, ninja |
+| `/v1/rc` | POST | Submit resource compilation action | `forge-rc.exe`, ninja |
+| `/v1/ml` | POST | Submit assembly action | `forge-ml.exe`, ninja |
 | `/v1/status` | GET | Daemon status, build progress | Build system, CLI tools |
 | `/v1/artifact/{hash}` | GET | Fetch artifact by content hash | Peers, `forge-verify` |
 | `/v1/artifact/{hash}` | PUT | Store/announce artifact | Peers |
@@ -1172,7 +1971,7 @@ dumpbin/llvm-objdump.
 
 **Note on DAP transport**: VS Code's standard DAP integration uses **JSON-over-stdio**
 (VS Code launches the debug adapter as a child process). The daemon supports this as
-its primary DAP transport — a thin `forgecc-dap` wrapper process connects to the
+its primary DAP transport — a thin `forge-dap` wrapper process connects to the
 daemon's HTTP API internally and bridges to stdio for VS Code. The `/v1/debug/*` HTTP
 endpoints provide an alternative for clients that prefer HTTP (e.g., custom IDE
 integrations, web-based debuggers).
@@ -1247,19 +2046,22 @@ forgecc/
 │   │   ├── src/
 │   │   │   ├── lib.rs            # Public API (~200 lines)
 │   │   │   ├── context.rs        # Shared semantic context
-│   │   │   ├── lookup/           # Name lookup (5 files, ~2000 lines total)
-│   │   │   ├── types/            # Type system (5 files, ~3000 lines total)
-│   │   │   ├── overload/         # Overload resolution (3 files, ~2000 lines)
-│   │   │   ├── templates/        # Template instantiation (3 files, ~3000 lines)
+│   │   │   ├── lookup/           # Name lookup (6 files, ~2500 lines total)
+│   │   │   ├── types/            # Type system (6 files, ~3500 lines total)
+│   │   │   ├── overload/         # Overload resolution (5 files, ~3000 lines)
+│   │   │   ├── templates/        # Template instantiation (5 files, ~4000 lines)
 │   │   │   ├── concepts/         # C++20 concepts (2 files, ~1000 lines)
 │   │   │   ├── consteval/        # Constant evaluator (2 files, ~2000 lines)
-│   │   │   ├── decl/             # Declaration processing (5 files, ~3000 lines)
-│   │   │   ├── expr/             # Expression checking (6 files, ~4000 lines)
+│   │   │   ├── decl/             # Declaration processing (7 files, ~4000 lines)
+│   │   │   ├── expr/             # Expression checking (7 files, ~5000 lines)
 │   │   │   ├── stmt/             # Statement checking (2 files, ~500 lines)
-│   │   │   ├── msvc/             # MSVC-specific (4 files, ~3000 lines)
+│   │   │   ├── msvc/             # MSVC-specific (6 files, ~4000 lines)
+│   │   │   ├── bindings.rs       # Structured binding decomposition (~500 lines)
+│   │   │   ├── comparisons.rs    # Defaulted comparison synthesis (~500 lines)
+│   │   │   ├── rtti.rs           # typeid, dynamic_cast support (~300 lines)
 │   │   │   └── access.rs         # Access control (~500 lines)
 │   │   └── Cargo.toml
-│   │   # Total: ~40 files, ~25,000 lines, no file > 1000 lines
+│   │   # Total: ~55 files, ~34,500 lines, no file > 1000 lines
 │   │
 │   ├── forge-ir/                 # Intermediate representation
 │   │   ├── src/
@@ -1318,10 +2120,25 @@ forgecc/
 │   │   │   └── hash.rs           # BLAKE3 hashing utilities
 │   │   └── Cargo.toml
 │   │
+│   ├── forge-driver/             # Thin driver binaries (see §7.3)
+│   │   ├── src/
+│   │   │   ├── main.rs           # Entry point: argv[0] detection, dispatch
+│   │   │   ├── detect.rs         # Tool name detection (forge-cc, forge-link, etc.)
+│   │   │   ├── args_cc.rs        # clang-cl flag parsing → CompileAction
+│   │   │   ├── args_link.rs      # lld-link flag parsing → LinkAction
+│   │   │   ├── args_lib.rs       # llvm-lib flag parsing → LibAction
+│   │   │   ├── args_rc.rs        # llvm-rc flag parsing → RcAction
+│   │   │   ├── args_ml.rs        # llvm-ml flag parsing → MlAction
+│   │   │   ├── client.rs         # HTTP/2 client (reqwest) → daemon RPC
+│   │   │   └── autostart.rs      # Daemon auto-start (spawn, wait for /v1/status)
+│   │   └── Cargo.toml
+│   │   # Build produces forge-daemon.exe + symlinks: forge-cc, forge-link,
+│   │   # forge-lib, forge-rc, forge-ml
+│   │
 │   └── forge-verify/             # Verification CLI tool (see §8b)
 │       ├── src/
 │       │   ├── main.rs           # CLI entry point, argument parsing
-│       │   ├── daemon_client.rs  # HTTP client to connect to forgecc daemon
+│       │   ├── daemon_client.rs  # HTTP client to connect to forge-daemon
 │       │   ├── reference.rs      # Invoke clang-cl / MSVC as reference compiler
 │       │   ├── diff_sections.rs  # Compare COFF sections, symbols, relocations
 │       │   ├── diff_debug.rs     # Invoke llvm-debuginfo-analyzer --compare
@@ -1498,15 +2315,21 @@ or cache infrastructure to deploy or maintain.
 
 ## 7. Build System Integration
 
-### 7.1 UBT Integration (Primary)
+### 7.1 Unreal Build Tool (UBT) Integration (Primary)
 
-A new `ForgeccToolChain.cs` in UBT that:
-1. Constructs `ForgeccCompileAction` objects from `CppCompileEnvironment`
-2. Sends them to the **forgecc** daemon via HTTP (`POST /v1/compile`)
-3. Receives compilation results (success/failure + diagnostics)
-4. Reports results back to UBT's action graph
+Two approaches, used in sequence:
 
-Based on the existing `VCCompileAction` structure, the data we need to send:
+**Quick start (spawn driver)**: A new `ForgeccToolChain.cs` that points
+`CompilerPath` at `forge-cc.exe` (see §7.3). UBT spawns it exactly like
+`clang-cl.exe` — no changes to UBT's action execution model, only the toolchain
+path changes (~5 lines). This is the initial integration path.
+
+**Optimized (direct HTTP)**: `ForgeccToolChain.cs` constructs
+`ForgeccCompileAction` objects and sends them to the daemon via HTTP
+(`POST /v1/compile`) directly, bypassing process spawning entirely. This
+eliminates per-action process creation overhead for UE5's hundreds of compile
+actions. The data sent is the same either way:
+
 - Source file path
 - Include paths (user + system + VC include paths)
 - Preprocessor definitions
@@ -1514,6 +2337,9 @@ Based on the existing `VCCompileAction` structure, the data we need to send:
 - Language standard (C++20)
 - Architecture (x64)
 - PCH settings → **ignored by forgecc** (automatic caching replaces PCH)
+
+Both approaches report results back to UBT's action graph (success/failure +
+diagnostics).
 
 ### 7.2 Native Mode
 
@@ -1532,6 +2358,130 @@ include_paths = ["unreal/Engine/Source/Runtime/Core/Public", ...]
 definitions = ["UE_BUILD_DEVELOPMENT=1", "WITH_EDITOR=1"]
 ```
 
+### 7.3 Thin Driver Binaries (The Forge Tool Family)
+
+**forgecc** provides a family of thin driver binaries that present a standard
+compiler/linker interface to build systems. Each binary is the **same Rust
+executable**, distinguished by `argv[0]` — the same pattern clang uses for
+`clang`, `clang++`, and `clang-cl` (a single binary with symlinks/copies).
+
+```
+forge-daemon.exe     ← main binary (the daemon)
+forge-cc.exe         ← symlink/copy, clang-cl-compatible compiler driver
+forge-link.exe       ← symlink/copy, lld-link-compatible linker driver
+forge-lib.exe        ← symlink/copy, llvm-lib-compatible librarian driver
+forge-rc.exe         ← symlink/copy, llvm-rc-compatible resource compiler driver
+forge-ml.exe         ← symlink/copy, llvm-ml-compatible assembler driver
+```
+
+**argv[0] detection**: On startup, the binary extracts the filename from `argv[0]`,
+strips `.exe`, lowercases on Windows, and matches against the known tool names. This
+determines which command-line format to parse and which daemon endpoint to call.
+`--driver-mode=X` overrides the name-based detection (same as clang).
+
+**Each driver**:
+1. Parses the command line in the format of its corresponding LLVM/MSVC tool
+2. Connects to the local daemon (`localhost:9473`) via HTTP/2
+3. POSTs the action to the appropriate `/v1/*` endpoint
+4. Streams diagnostics (warnings/errors) to stderr
+5. Writes output files to the paths the build system expects
+6. Exits with 0 (success) or 1 (failure)
+
+**Daemon auto-start**: If the driver cannot connect to the daemon, it starts
+`forge-daemon.exe` as a background process (detached, writes PID file), waits
+for it to become ready (poll `/v1/status`), then proceeds. This means developers
+never need to manually start the daemon — the first build invocation starts it
+automatically.
+
+**Tool-to-endpoint mapping**:
+
+| Driver binary | Emulates | Daemon endpoint | Flags accepted |
+|---|---|---|---|
+| `forge-cc.exe` | `clang-cl.exe` | `/v1/compile` | `/c`, `/Fo`, `/I`, `/D`, `-std:c++20`, etc. |
+| `forge-link.exe` | `lld-link.exe` | `/v1/link` | `/OUT:`, `/DLL`, `/LIBPATH:`, `.obj` paths |
+| `forge-lib.exe` | `llvm-lib.exe` | `/v1/lib` | `/OUT:`, `.obj` paths |
+| `forge-rc.exe` | `llvm-rc.exe` | `/v1/rc` | `/fo`, `.rc` path |
+| `forge-ml.exe` | `llvm-ml64.exe` | `/v1/ml` | `/c`, `/Fo`, `.asm` path |
+
+**Implementation**: The driver is a single Rust crate (`forge-driver`, ~800 lines)
+that compiles to one binary. The build system produces the binary as `forge-daemon.exe`
+and creates symlinks/copies for each tool name (via `build.rs` or a post-build step).
+
+### 7.4 Ninja Daemon Mode (Zero Process Spawning)
+
+For maximum build performance, **forgecc** includes a small patch to
+[ninja](https://ninja-build.org/) that eliminates process spawning entirely for
+forge-family tools. When ninja detects that a build rule's command uses a forge
+tool, it routes the action directly to the daemon via RPC instead of calling
+`CreateProcess()`.
+
+**Detection**: When ninja loads `build.ninja`, for each `rule`, it checks whether
+the command's tool path ends with a forge-family binary name (`forge-cc.exe`,
+`forge-link.exe`, `forge-lib.exe`, `forge-rc.exe`, `forge-ml.exe`). This is a
+simple string suffix check on the first token of the command.
+
+**RPC dispatch**: For matched rules, instead of spawning a process, ninja:
+1. Opens a single HTTP/2 connection to the daemon (on first use, kept alive for
+   the entire build session)
+2. Parses the command line into the tool type + arguments
+3. POSTs to the appropriate `/v1/*` endpoint as a new HTTP/2 stream
+4. Streams stdout/stderr back from the response body
+5. Reports success/failure to ninja's build graph as if the process had exited
+
+**Non-forge rules**: Any rule whose tool is NOT a forge-family binary (e.g.,
+`rc.exe`, `midl.exe`, `mt.exe`, custom build steps) continues to spawn processes
+normally. Ninja's existing process pool handles these unchanged.
+
+**Fallback**: If the daemon is not reachable, ninja falls back to spawning the
+thin driver binary (which will auto-start the daemon). The system is always
+correct, just slower without the daemon running.
+
+**Why this matters**: A typical UE5 editor build has ~5,000+ compile actions.
+Spawning 5,000 processes (even thin ones) has measurable overhead on Windows
+(~1–5 ms per `CreateProcess` call = 5–25 seconds total). With ninja daemon mode,
+all 5,000 actions are HTTP/2 streams on a single TCP connection — zero process
+creation, zero context switches, zero file system overhead from process startup.
+
+**Estimated ninja patch size**: ~300–500 lines of C++ in ninja's `subprocess.cc`
+/ `build.cc`:
+- Tool detection in rule parsing (~50 lines)
+- HTTP/2 client using a lightweight C library (e.g., nghttp2 or libcurl with
+  HTTP/2) (~200 lines)
+- Response streaming and exit code mapping (~100 lines)
+- Connection lifecycle management (~50 lines)
+
+### 7.5 CMake Compatibility
+
+CMake must see a real compiler executable for configuration. `forge-cc.exe`
+satisfies this by identifying as clang-cl.
+
+**Version string**: `forge-cc.exe --version` outputs:
+```
+clang version 17.0.0 (forgecc 0.1.0)
+Target: x86_64-pc-windows-msvc
+Thread model: posix
+```
+
+This causes CMake to set `CMAKE_CXX_COMPILER_ID=Clang` and
+`CMAKE_CXX_SIMULATE_ID=MSVC`, inheriting all of CMake's existing clang-cl
+support. No CMake changes needed.
+
+**What CMake does during configuration** (all handled by the thin driver):
+
+1. **`--version`** — parseable version string (see above)
+2. **`try_compile`** — compiles a small test program and produces a `.obj`.
+   The driver forwards to the daemon, which produces a valid COFF `.obj`.
+3. **Feature detection** — compiles snippets to detect C++ standard support
+   (`-std:c++20`, etc.). Works because we accept clang-cl flags.
+4. **ABI detection** — compiles `CMakeCXXCompilerABI.cpp` and inspects the
+   `.obj` for ABI information. Our `.obj` must be valid COFF with correct
+   section names and symbol types.
+
+**Flow**: CMake invokes `forge-cc.exe` during configure (spawning the thin
+driver). The generated `build.ninja` references `forge-cc.exe` as the compiler.
+When `ninja` runs the build, it detects the forge tool and switches to daemon
+mode (§7.4), bypassing process spawning for all compile/link actions.
+
 ---
 
 ## 8. Phased Implementation Plan
@@ -1547,8 +2497,8 @@ definitions = ["UE_BUILD_DEVELOPMENT=1", "WITH_EDITOR=1"]
 > | Design-heavy but with good references | 1.5–2x faster | Parser, IR design, codegen lowering, linker |
 > | Subtle correctness / deep language semantics | 1–1.5x faster | Sema (templates, overload resolution, concepts), JIT patching, distributed consistency |
 >
-> **Adjusted total**: The ~98 manual weeks could realistically compress to
-> **~33–49 weeks** for one person working full-time with AI assistance. The largest
+> **Adjusted total**: The ~108 manual weeks could realistically compress to
+> **~36–54 weeks** for one person working full-time with AI assistance. The largest
 > gains come from the lexer/preprocessor, codegen, and linker phases; the smallest
 > from Sema and JIT runtime correctness work.
 
@@ -1568,9 +2518,19 @@ definitions = ["UE_BUILD_DEVELOPMENT=1", "WITH_EDITOR=1"]
 other, store get/put works locally and across network. All data structures use
 deterministic ordering.
 
-### Phase 1: Frontend — Lexer & Preprocessor (Weeks 5–10)
-- [ ] `forge-lex`: Full C/C++20 lexer
-- [ ] `forge-pp`: Preprocessor with all required directives
+### Phase 1: Frontend — Lexer & Preprocessor (Weeks 5–12)
+- [ ] `forge-lex`: Full C/C++20 lexer including:
+  - [ ] All literal types (integer, float, char, string) with all encoding prefixes
+  - [ ] Raw string literals with delimiter matching and line-splice reversion
+  - [ ] User-defined literal token recognition (`ud-suffix`)
+  - [ ] Hexadecimal floating-point literals
+  - [ ] Phase 1–2: UTF-8 decoding, BOM stripping, line splicing
+  - [ ] Phase 5–6: Adjacent string literal concatenation with encoding compatibility
+- [ ] `forge-pp`: Preprocessor with all required directives including:
+  - [ ] `#pragma pack`, `#pragma warning` (critical for MSVC STL compatibility)
+  - [ ] `#line`, `#error`, `#warning`, null directive
+  - [ ] `__has_builtin`, `__has_feature`, `__has_extension`
+  - [ ] All predefined macros (`__cplusplus`, `_MSC_VER`, `__cpp_*` feature-test macros)
 - [ ] Automatic header caching (replaces PCH)
 - [ ] Memoization of preprocessed output in the store
 - [ ] Basic Windows SDK header compatibility (start testing against `<windows.h>`
@@ -1580,22 +2540,55 @@ deterministic ordering.
 cached. No PCH configuration needed. Target level I (hand-crafted tests) preprocesses
 correctly.
 
-### Phase 2: Parser (Weeks 11–18)
+### Phase 2: Parser + Driver Binaries (Weeks 13–20)
 - [ ] `forge-parse`: Recursive descent parser for C and C++20
 - [ ] AST definition covering UE5's usage patterns
 - [ ] Concepts/requires-clause parsing
+- [ ] `extern "C"` / linkage specification parsing
+- [ ] `explicit(bool)` conditional explicit parsing
+- [ ] `constinit` declaration parsing
+- [ ] CTAD / deduction guide declaration parsing
+- [ ] Bit-field member declarations
+- [ ] `static_assert` with optional message
+- [ ] `alignas` / `alignof` parsing
+- [ ] `noexcept` specifier and operator parsing
+- [ ] Attribute argument parsing (string arguments for `[[nodiscard("msg")]]`, etc.)
 - [ ] Error recovery
+- [ ] `forge-driver`: Thin driver binaries (see §7.3):
+  - [ ] argv[0] detection and tool dispatch
+  - [ ] clang-cl flag parsing (`forge-cc.exe`)
+  - [ ] HTTP/2 client → daemon RPC
+  - [ ] Daemon auto-start
+  - [ ] `--version` output for CMake compatibility (see §7.5)
+  - [ ] Symlink/copy generation for forge-cc, forge-link, forge-lib, forge-rc, forge-ml
 
 **Milestone**: Can parse UE5/Game source files into an AST. Target level I parses
-correctly.
+correctly. `forge-cc.exe --version` works with CMake; `cmake -G Ninja` generates
+a valid `build.ninja` referencing forge-cc.
 
-### Phase 3: Semantic Analysis (Weeks 19–34)
+### Phase 3: Semantic Analysis (Weeks 21–38)
 - [ ] `forge-sema`: Modular Sema (see §4.5 for structure)
-- [ ] Name lookup, type checking (parallel where possible)
-- [ ] Template instantiation with memoization
-- [ ] Overload resolution
+- [ ] Name lookup (including two-phase lookup for templates), type checking (parallel
+  where possible)
+- [ ] Template instantiation with Tier 1 memoization (structural key — see §4.2)
+- [ ] CTAD: deduction guide synthesis, implicit guides from constructors, aggregate
+  deduction guides
+- [ ] Template template parameters, class-type NTTPs (structural types)
+- [ ] Overload resolution (including built-in operator candidates, user-defined literal
+  operator resolution, address of overloaded function)
 - [ ] Concept satisfaction checking
-- [ ] MSVC class layout and name mangling
+- [ ] `noexcept` as part of function type; `noexcept` operator evaluation
+- [ ] `extern "C"` linkage: name mangling suppression, calling convention
+- [ ] `explicit(bool)` conditional explicit evaluation
+- [ ] `constinit` validation (must be constant-initialized)
+- [ ] Structured binding decomposition (tuple-like, array, data member)
+- [ ] Defaulted comparison operators (`= default` for `==` and `<=>`)
+- [ ] Brace-enclosed initializer lists / `std::initializer_list` construction /
+  narrowing conversion detection / aggregate initialization rules
+- [ ] `static_assert` evaluation
+- [ ] `alignas` / `alignof` evaluation
+- [ ] RTTI support: `typeid`, `dynamic_cast`
+- [ ] MSVC class layout and name mangling (including `#pragma pack` effects)
 - [ ] `constexpr` basic evaluation (literal folding, simple expressions)
 - [ ] `consteval` context detection — Sema records deferred `consteval` calls for
   later JIT evaluation (requires IR + codegen + JIT from Phases 4–5; see §4.6a)
@@ -1606,7 +2599,7 @@ correctly.
 **Milestone**: Can type-check UE5/Game source files. No Sema file > 1000 lines.
 `consteval` contexts are detected and recorded; full evaluation deferred to Phase 6.
 
-### Phase 4: IR & Code Generation (Weeks 35–46)
+### Phase 4: IR & Code Generation (Weeks 39–50)
 - [ ] `forge-ir`: SSA-based IR with SIMD intrinsic support
 - [ ] Minimal passes (DCE, constant folding)
 - [ ] `forge-codegen`: x86-64 lowering, register allocation, emission
@@ -1620,19 +2613,25 @@ correctly.
 **Milestone**: Can compile simple C/C++ programs to working x86-64 code. Levels I–II
 pass `forge-verify`.
 
-### Phase 5: Runtime Loader / JIT (Weeks 47–54)
+### Phase 5: Runtime Loader / JIT + Ninja Patch (Weeks 51–58)
 - [ ] `forge-daemon/loader.rs`: Process creation, section mapping
 - [ ] Lazy compilation stubs
 - [ ] Incremental patching (function-level)
 - [ ] Import library parsing (.lib) for Windows SDK / third-party DLLs
 - [ ] Static initializer ordering and execution
 - [ ] Exception handling registration (`RtlAddFunctionTable`)
+- [ ] **Ninja daemon mode patch** (see §7.4):
+  - [ ] Fork ninja, add forge tool detection in rule parsing
+  - [ ] HTTP/2 client (nghttp2 or libcurl) for daemon RPC
+  - [ ] Response streaming and exit code mapping
+  - [ ] Fallback to process spawning when daemon is unreachable
 - [ ] **Target level III**: LMDB compiles, links, and runs via JIT
 
 **Milestone**: Can JIT-compile and run a simple C++ program. Changes are patched live.
+Ninja daemon mode eliminates process spawning for forge tools.
 Target level III passes `forge-verify`.
 
-### Phase 6: `consteval`/`constexpr` via JIT (Weeks 55–57)
+### Phase 6: `consteval`/`constexpr` via JIT (Weeks 59–61)
 - [ ] `forge-sema/consteval`: Wire deferred `consteval` calls to the JIT pipeline
 - [ ] Compile `consteval` functions to native code via forge-ir → forge-codegen
 - [ ] Map compiled code into daemon's address space (`VirtualAlloc` + `PAGE_EXECUTE`)
@@ -1646,7 +2645,7 @@ Target level III passes `forge-verify`.
 cached and reused across TUs. No AST interpreter needed. Levels IV–VI pass
 `forge-verify`.
 
-### Phase 7: DAP Debugger (Weeks 58–61)
+### Phase 7: DAP Debugger (Weeks 62–65)
 - [ ] `forge-debug`: DAP protocol server (JSON-over-stdio)
 - [ ] Breakpoint management (int3 patching)
 - [ ] Single-stepping (hardware debug registers)
@@ -1656,7 +2655,7 @@ cached and reused across TUs. No AST interpreter needed. Levels IV–VI pass
 
 **Milestone**: Can debug JIT-compiled programs from VS Code. No PDB needed.
 
-### Phase 8: Linker — Release Mode (Weeks 62–67)
+### Phase 8: Linker — Release Mode (Weeks 66–71)
 - [ ] `forge-link`: Symbol resolution, section layout
 - [ ] PE executable generation
 - [ ] DLL generation (for UE5 module structure)
@@ -1668,7 +2667,7 @@ cached and reused across TUs. No AST interpreter needed. Levels IV–VI pass
 **Milestone**: Can link multi-file C++ programs into working PE executables and DLLs.
 Target level VII provides regression coverage.
 
-### Phase 9: Real-Time Content Project (Weeks 68–71)
+### Phase 9: Real-Time Content Project (Weeks 72–75)
 - [ ] **Target level VIII**: Compile raylib + a small real-time demo
 - [ ] Multi-TU linking with D3D11/Win32 interop
 - [ ] JIT-compile and run the demo via the daemon
@@ -1680,7 +2679,7 @@ Target level VII provides regression coverage.
 the daemon. This validates the full pipeline (compile → link → JIT → patch) on a
 real-world content project before tackling UE5.
 
-### Phase 10: forge-demo — Full-Feature Showcase (Weeks 72–74)
+### Phase 10: forge-demo — Full-Feature Showcase (Weeks 76–78)
 - [ ] **Target level IX**: Write and compile **forge-demo** (~2–5k LoC C++20 app)
 - [ ] C++20 feature coverage: `concept`, `requires`, structured bindings, `if constexpr`,
   `auto` return types, `consteval` lookup tables (sin/cos, color palettes)
@@ -1698,7 +2697,7 @@ demo provides a compelling visual demonstration of **forgecc**'s value propositi
 All C++20 features, SIMD, SEH, DLL linking, DAP, and distributed compilation work
 correctly on this project before moving to UE5.
 
-### Phase 11: UE5/Game Integration (Weeks 75–90)
+### Phase 11: UE5/Game Integration (Weeks 79–96)
 - [ ] UBT integration (`ForgeccToolChain.cs`) — replaces the CLI/curl workflow with
   native UBT support; compile and link actions flow through UBT's action graph
 - [ ] Handle UE5-specific patterns (UHT-generated code, `*_API` DLL exports, etc.)
@@ -1713,11 +2712,15 @@ correctly on this project before moving to UE5.
 
 **Milestone**: Game editor builds and runs via the daemon. Debugging works via DAP.
 
-### Phase 12: Distributed Features (Weeks 91–98)
+### Phase 12: Distributed Features & Memoization Optimization (Weeks 97–108)
 - [ ] Full DHT implementation with replication
 - [ ] Cross-machine artifact sharing
 - [ ] Benchmark: two machines sharing compilation work
 - [ ] File watching and pre-compilation
+- [ ] Template instantiation memoization Tier 2 (recorded dependency signatures — see §4.2):
+  profile UE5 builds to identify most-instantiated templates, instrument dependency
+  recording, validate signature cost stays within budget
+- [ ] Namespace content hash caching (Tier 3) for associated-namespace lookups
 
 **Milestone**: Two machines share compilation work via P2P network.
 
@@ -1884,19 +2887,20 @@ debugging individual compilation issues.
 | Crate | Estimated LoC | Notes |
 |---|---|---|
 | `forge-common` | 2,000 | Diagnostics, source map, interning |
-| `forge-store` | 3,500 | Local store + distributed layer + dependency signature tracking (+500) |
+| `forge-store` | 4,500 | Local store + distributed layer + dependency signature tracking (+500) + namespace content hash caching + template instantiation cache (+1000) |
 | `forge-net` | 5,000 | HTTP server (axum), MessagePack/JSON content negotiation, P2P networking, DHT, gossip |
-| `forge-lex` | 4,000 | Lexer + literal parsing (C + C++) |
-| `forge-pp` | 6,000 | Preprocessor + macro expansion |
-| `forge-parse` | 15,000 | Parser + AST definitions (C + C++) |
-| `forge-sema` | 22,000 | Modular Sema (~40 files, none > 1000 lines); consteval via JIT saves ~3k lines vs interpreter |
+| `forge-lex` | 5,000 | Lexer + literal parsing (C + C++); raw strings, UDL, all encoding prefixes, hex floats |
+| `forge-pp` | 7,500 | Preprocessor + macro expansion; #pragma pack/warning, feature-test macros, predefined macros |
+| `forge-parse` | 16,000 | Parser + AST definitions (C + C++); CTAD, extern "C", explicit(bool), bit-fields |
+| `forge-sema` | 34,500 | Modular Sema (~52 files, none > 1000 lines); two-phase lookup, CTAD, UDL resolution, noexcept types, defaulted comparisons, structured bindings, brace init, RTTI, MSVC __declspec/intrinsics; template instantiation memoization instrumentation (+3000); consteval via JIT saves ~3k lines vs interpreter |
 | `forge-ir` | 5,000 | IR + minimal passes |
 | `forge-codegen` | 14,000 | x86-64 lowering + encoding + SIMD |
 | `forge-debug` | 3,000 | DAP server + breakpoints + variable inspection |
 | `forge-link` | 6,000 | Linker + PE + DLL (PDB deferred to release mode) |
 | `forge-daemon` | 5,500 | Daemon + scheduler + loader/JIT + determinism verification (HTTP server moved to forge-net) |
+| `forge-driver` | 800 | Thin driver binaries: argv[0] detection, clang-cl/lld-link/llvm-lib/llvm-rc/llvm-ml flag parsing, HTTP client, daemon auto-start (see §7.3) |
 | `forge-verify` | 1,500 | Verification CLI: daemon client, reference compiler diff, execution diff (see §8b) |
-| **Total** | **~92,500** | |
+| **Total** | **~110,300** | + ~300–500 lines C++ ninja patch (external, see §7.4) |
 
 ---
 
@@ -2021,22 +3025,26 @@ The UE5 editor target uses DLLs, so we link against the DLL versions of the CRT
 
 ## 14. C++20 Modules Decision
 
-**Not implementing C++20 modules for the PoC.** Rationale:
+**forgecc does not implement C++20 modules.** The reasons:
 
 - UE5/Game has **zero** usage of C++20 modules (`export module`, `import`)
 - UE5's "modules" are its own build system concept (`.Build.cs`, `Private`/`Public`
   directories), not C++20 modules
-- The purpose of C++20 modules is primarily build time improvement — which **forgecc**
-  achieves through its memoization/caching system instead
+- C++20 modules exist primarily for build time improvement — **forgecc** achieves the
+  same through its memoization/caching system, making modules redundant
 - C++20 modules add significant compiler complexity (module dependency scanning,
-  BMI generation, build ordering constraints)
+  BMI generation, build ordering constraints) for no benefit in our target codebase
 
-If modules become needed later, the architecture supports them — the content-addressed
-store naturally handles BMI caching.
+The architecture naturally supports modules (the content-addressed store handles
+BMI caching), so adding them post-PoC is straightforward if a target codebase
+requires them.
 
 ---
 
-## 15. UE5/Game Codebase Analysis Findings
+## 15. UE5 Codebase Analysis Findings (Verified Against Source)
+
+> The findings below are based on a thorough automated scan of
+> `C:\src\git\UnrealEngine\Engine\Source\` (Runtime, Editor, ThirdParty).
 
 ### 15.1 C Code
 - **4,335 .c files** in Engine/Source (all third-party: zlib, libpng, FreeType,
@@ -2045,9 +3053,10 @@ store naturally handles BMI caching.
 - **forgecc** must support C compilation for these third-party libraries
 
 ### 15.2 Inline Assembly (`__asm`)
-- **~23 files** in Engine/Source/Runtime use `__asm`
-- Mostly in: audio codecs (Bink, Rad), platform detection, floating point state,
-  AutoRTFM LongJump
+- **~20 files** in Engine/Source/Runtime use MSVC-style `__asm` / `_asm`
+- Key locations: RadAudio `rrCore.h`, BinkAudio `rrCore.h` / `win32_ticks.cpp`,
+  MemPro `MemPro.cpp`, AutoRTFM `LongJump.cpp`
+- GNU-style `__asm__` also used in cross-platform code (Unix, ARM, x86 breakpoints)
 - Most are in third-party SDK code that could potentially be linked as prebuilt
 - **Strategy**: Support basic `__asm` blocks; complex cases fall back to prebuilt stubs
 
@@ -2060,30 +3069,111 @@ store naturally handles BMI caching.
 - **Critical**: Must support SSE/AVX intrinsics from day one
 
 ### 15.4 SEH (`__try/__except/__finally`)
-- **22 files** in Engine/Source/Runtime
-- Concentrated in: crash handling (`WindowsPlatformCrashContext.cpp` — 20 matches),
-  D3D11/D3D12 device creation, thread management, stack walking
+- **~20 files** in Engine/Source/Runtime
+- Concentrated in: crash handling (`WindowsPlatformCrashContext.cpp`), D3D11/D3D12
+  device creation (delay-load exception handling), thread management
+  (`WindowsRunnableThread.cpp`), stack walking (`WindowsPlatformStackWalk.cpp`),
+  rendering thread (`RenderingThread.cpp`), shader compilation (`ShaderCore.cpp`),
+  race detector (`RaceDetectorWindows.cpp`)
 - **Important** for Windows stability, but not in hot paths
 
-### 15.5 C++20 Features
-- **Concepts/requires**: ~200+ files use concepts. UE5 defines its own concepts in
-  `Core/Public/Concepts/` (CSameAs, CDerivedFrom, CConvertibleTo, CFloatingPoint,
-  CIntegral, CPointer, etc.). Also used in MassEntity, CoreUObject, TypedElementFramework.
-  **Must support.**
-- **consteval**: ~20 files (D3D12RHI, VerseVM, CoreUObject). **Must support.**
-- **Three-way comparison (`<=>`)**: Used in abseil (third-party) and D3D12RHI. **Should support.**
-- **Coroutines**: **Zero** usage. Not needed.
-- **C++20 modules**: **Zero** usage. Not needed.
+### 15.5 C++20 Feature Usage (Detailed)
 
-### 15.6 MS Extensions
-- `__declspec(dllexport/dllimport)` — pervasive via `*_API` macros (CORE_API, ENGINE_API, etc.)
-- `__forceinline` — pervasive via `FORCEINLINE` macro
-- `__declspec(align(...))` — used for SIMD alignment
-- `__pragma` — used in various places
-- `__int64`, `__cdecl`, `__stdcall` — Windows API interop
-- **All critical, must support**
+| Feature | Files | Usage Level | Notes |
+|---|---|---|---|
+| **Concepts/requires** | ~95+ | **Critical** | UE defines 20+ concepts in `Core/Public/Concepts/`; used in MassEntity, TypedElementFramework, Chaos, CoreUObject. `UE_REQUIRES` macro wraps `requires` with SFINAE fallback. |
+| **`if constexpr`** | ~91+ | **Critical** | Pervasive: TypedElementFramework, SlateCore, RenderCore, MovieScene, Net/Iris, VerseCompiler, VulkanRHI, DelegateSignatureImpl (72 uses), Array.h (31 uses) |
+| **Structured bindings** | ~33+ | **Moderate** | RenderGraphBuilder, ActorDescContainer, MaterialExpressions, VerseVM |
+| **consteval** | ~6 | **Rare** | Via `UE_IF_CONSTEVAL` macro (expands to `if consteval` or `__builtin_is_constant_evaluated()`); Platform.h, StringView.h, NameTypes.h |
+| **constinit** | ~14 | **Rare** | Mostly CoreUObject: UObjectGlobals.h, Object.h, Class.h, ObjectMacros.h |
+| **Three-way comparison (`<=>`)** | ~10 | **Rare** | GuardedInt.h, GenericPlatformMath.h, EdGraphPin.h, RenderGraphUtils.h |
+| **Designated initializers** | ~6 | **Rare** | Net/Iris, AppleDynamicRHI, ReplicationSystem |
+| **`using enum`** | ~4 | **Rare** | NavigationSystem.h, ISpatialAcceleration.h |
+| **User-defined literals** | ~4 | **Rare** | Delegate.h (`operator""_intseq`), StringView.h (`operator""_PrivateSV`) |
+| **Fold expressions** | ~1 | **Rare** | Solaris/uLangCore Cases.h |
+| **Lambdas with template params** (`[]<`) | ~5 | **Rare** | Core tests, VerseVM, GeometryCore |
+| **CTAD (deduction guides)** | ~2 | **Rare** | StringBuilderTest.cpp only |
+| **char8_t** | ~6 | **Rare** | VerseGrammar.h, GenericPlatform.h, StringView.h, StringConv.h |
+| **Coroutines** | **0** | **Not used** | Zero in Engine; only in ThirdParty docs/comments |
+| **C++20 modules** | **0** | **Not used** | Zero usage |
+| **`std::ranges` / `std::views`** | **0** | **Not used** | UE uses custom iterators |
+| **`std::format`** | **0** | **Not used** | UE uses `FString::Printf` / `fmt` |
+| **`std::span`** | **0** | **Not used** | UE uses `TArrayView` / `FMemoryView` |
+| **`std::expected`** | **0** | **Not used** | Only in ThirdParty (WebRTC) |
 
-### 15.7 DLL Structure
+### 15.6 MS Extensions (Detailed)
+
+| Extension | Usage | Priority |
+|---|---|---|
+| `__declspec(dllexport/dllimport)` | Pervasive via `*_API` macros | **Critical** |
+| `__forceinline` | 200+ files via `FORCEINLINE` macro | **Critical** |
+| `__declspec(noinline)` | WindowsPlatform.h (`FORCENOINLINE`), MemPro, AutoRTFM | **High** |
+| `__declspec(align(N))` | ~8 files (mostly third-party); `alignas` preferred (~75 files) | **Medium** |
+| `__declspec(thread)` | syms_base.h, RadAudio, MemPro, FramePro | **High** |
+| `__declspec(selectany)` | Platform.h (`UE_SELECT_ANY`), RadAudio, BinkAudio | **High** |
+| `__declspec(empty_bases)` | WindowsPlatform.h | **Medium** |
+| `__declspec(noreturn)` | MicrosoftPlatformCodeAnalysis.h | **Medium** |
+| `__declspec(restrict)` / `noalias` | MemoryArena.h, MemPro | **Low** |
+| `__declspec(code_seg)` | WindowsPlatform.h | **Low** |
+| `__declspec(allocate)` | syms_base.h (`.roglob`), RaceDetector (`.CRT$XCT`) | **Medium** |
+| `__declspec(safebuffers)` | Instrumentation/Defines.h | **Low** |
+| `__declspec(deprecated)` | LZ4 only | **Low** |
+| `__declspec(novtable)` | **Not used** | Skip |
+| `__declspec(property)` | **Not used** | Skip |
+| `__pragma` | ~12 files; MSVCPlatformCompilerPreSetup.h (warning macros) | **High** |
+| `__int64` | ~9 files (RadAudio, BinkAudio, SymsLib — third-party) | **Medium** |
+| `__cdecl` / `__stdcall` | Common (Windows API, COM, CRT callbacks) | **High** |
+| `__fastcall` / `__vectorcall` / `__thiscall` | **Not used** | Skip |
+| `__assume` | ~6 files; `UE_ASSUME` macro in Platform.h | **Medium** |
+| `_alloca` / `alloca` | ~15 files; stack allocation in Renderer, Core, BinkAudio | **Medium** |
+
+### 15.7 MSVC Intrinsics
+
+| Intrinsic | Used | Key Locations |
+|---|---|---|
+| `_BitScanForward` / `_BitScanForward64` | Yes | LZ4, RadAudio, D3D12 |
+| `_BitScanReverse` / `_BitScanReverse64` | Yes | Same |
+| `_InterlockedCompareExchange*` | Yes | WindowsPlatformAtomics.h |
+| `__debugbreak` | Yes | Solaris, RadAudio, VerseGrammar |
+| `_ReturnAddress` / `_AddressOfReturnAddress` | Yes | MSVCPlatform.h, RaceDetector |
+| `__cpuid` / `__cpuidex` | Yes | RadAudio cpux86.cpp, VVMAtomics.h |
+| `_byteswap_ushort` / `_ulong` / `_uint64` | Yes | RadAudio, BinkAudio |
+
+### 15.8 Preprocessor Patterns
+
+| Pattern | Usage | Notes |
+|---|---|---|
+| `#pragma once` | **Dominant** | Used in virtually all UE headers |
+| `#pragma pack` | ~37 files | SymsLib, TraceLog, RenderCore, Oodle, D3D11/D3D12 |
+| `#pragma warning` | ~80 files | MSVCPlatformCompilerSetup.h alone has ~97 uses |
+| `#pragma comment(lib, ...)` | ~17 files | psapi, pdh, version, Shlwapi, Dbghelp, Ws2_32, d3d12, etc. |
+| `__has_include` | ~60 files | Platform.h, ThirdParty (abseil, WebRTC, Vulkan, SDL3) |
+| `__has_cpp_attribute` | ~60 files | Mostly ThirdParty (simde, hedley, abseil, Catch2) |
+| `__VA_ARGS__` | 100+ files | PreprocessorHelpers.h, LogMacros, delegates, profiling |
+| `__VA_OPT__` | ~10 files | Mostly ThirdParty (fmt, Catch2) |
+| `_Pragma` | ~60 files | Mostly ThirdParty (simde, hedley, abseil, WebRTC) |
+| Token pasting (`##`) | 60+ files | PreprocessorHelpers, Stats, Delegates, LogMacros |
+
+### 15.9 Template & Metaprogramming Complexity
+
+**Most template-heavy areas** (in order of complexity):
+1. `Runtime/Core/Public/Templates/` — 80+ headers: traits, SFINAE, concepts, utilities
+2. `Runtime/Core/Public/Delegates/` — variadic delegate signatures, policy-based design
+3. `Runtime/Core/Public/Containers/` — TArray, TMap, TSet, allocators, iterators
+4. `Runtime/Core/Public/Misc/` — TVariant, TOptional, ExpressionParser, StringBuilder
+5. `Runtime/Core/Public/Concepts/` — 20+ C++20 concept definitions
+
+**Key patterns**:
+- `TEnableIf` / `std::enable_if_t` for SFINAE (with `UE_REQUIRES` C++20 fallback)
+- `TAnd`, `TOr`, `TNot` for trait composition
+- Heavy variadic template usage in delegates, tuples, structured logging
+- `extern template` for compile-time control (StringFormatter, TokenStream, etc.)
+- Explicit template instantiation for common char types (ANSICHAR, WIDECHAR)
+- `decltype(auto)` for perfect forwarding (~20 files in Core)
+- Variable templates (`TModels_V`, `TIsVariant_V`, etc.)
+- `static_assert` — 100+ files in Runtime/Core
+
+### 15.10 DLL Structure
 - Game editor builds **~190 game modules** as DLLs (see `GameEditor.Target.cs`)
 - Engine adds hundreds more (Core, Engine, RHI, Slate, etc.)
 - Each module uses `*_API` macros for dllexport/dllimport
@@ -2094,30 +3184,45 @@ store naturally handles BMI caching.
   then build the real DLL. **forgecc** must handle this in release mode; in JIT mode,
   circular dependencies are resolved naturally since all symbols live in one address space
 
-### 15.8 UBT Compiler Invocation
+### 15.11 COM Usage
+- **~70+ files** in Runtime use COM interfaces (IUnknown, HRESULT, etc.)
+- Main areas: D3D11, D3D12, Windows WASAPI, WMF, TextStore, UIA
+- `COMPointer.h` in Core provides UE's COM smart pointer
+- `__uuidof` used for COM interface identification
+- **Must support**: `IUnknown`, `HRESULT`, `__uuidof`, COM calling conventions
+
+### 15.12 Resource Compiler (.rc) Files
+- **137 .rc files** in Engine/Source (44 in Runtime/Launch, rest in ThirdParty)
+- Primary: `Runtime/Launch/Resources/Windows/PCLaunch.rc`
+- **Out of scope for forgecc** — .rc files are compiled by `rc.exe`, not the C++ compiler
+
+### 15.13 UBT Compiler Invocation
 - `VCToolChain.cs` (~3,979 lines) handles both MSVC and clang-cl modes
 - `VCCompileAction.cs` structures compilation as action objects with all necessary metadata
 - **Clang-cl mode is the better integration point** for **forgecc**
 
+### 15.14 Features Confirmed NOT Used (Safe to Skip)
+
+These features have **zero usage** in Engine/Source and can be safely excluded from
+the PoC without risk:
+
+| Feature | Verified | Notes |
+|---|---|---|
+| C++20 Coroutines | Zero in Engine | Only in ThirdParty docs/comments (asio) |
+| C++20 Modules | Zero | UE "modules" are build system concept |
+| `std::ranges` / `std::views` | Zero | UE uses custom iterators/algorithms |
+| `std::format` | Zero | UE uses `FString::Printf`, `fmt` |
+| `std::span` | Zero | UE uses `TArrayView`, `FMemoryView` |
+| `std::expected` | Zero in Engine | Only in ThirdParty (WebRTC) |
+| `__declspec(novtable)` | Zero | |
+| `__declspec(property)` | Zero | |
+| `__fastcall` / `__vectorcall` / `__thiscall` | Zero | Only `__cdecl` and `__stdcall` used |
+| WinRT (`<winrt/>`) | Zero | |
+| WRL (`<wrl/>`) | Zero | |
+
 ---
 
-## 16. Resolved Questions
-
-1. **UHT (Unreal Header Tool)**: UHT now runs in-process within UBT (previously had
-   an out-of-process mode, no longer used). UHT generates `.generated.h` and
-   `.gen.cpp` files from UCLASS/UPROPERTY/UFUNCTION macros. **forgecc** consumes these
-   generated files as regular source — no special UHT handling needed. UHT runs as
-   part of UBT before **forgecc** receives compile actions.
-
-2. **Shader compilation**: Out of scope. HLSL shaders are compiled by
-   ShaderCompileWorker, which is a completely separate pipeline. Nothing to do for **forgecc**.
-
-3. **Debugger strategy**: DAP-first, no PDB for development builds (see §4.8). The
-   daemon IS the debugger. PDB generation is deferred to release mode only.
-
-4. **Memory budget**: Deferred. This is a PoC; memory optimization comes later.
-
-## 17. Deterministic Compilation (Required)
+## 16. Deterministic Compilation (Required)
 
 Deterministic compilation is **critical** for the distributed content-addressed store.
 If two machines compile the same inputs and get different outputs, the store's
@@ -2159,13 +3264,69 @@ Reference: [Deterministic builds with clang and lld](https://blog.llvm.org/2019/
    deterministic within a TU, so it's fine. But we must ensure it doesn't leak across
    TU boundaries.
 
-**Verification**: The daemon should have a `--verify-determinism` mode that compiles
-everything twice and asserts that all content hashes match. This catches determinism
-bugs early.
+**Pipeline computation determinism**:
 
-## 18. JIT Runtime Details
+The points above cover *output* determinism (what bytes end up in the store). But
+the memoization system also requires that *intermediate computations* within the
+pipeline are deterministic — if a pipeline stage produces a different intermediate
+result for the same inputs, downstream cache keys diverge and memoization breaks.
+Every stage must be a pure function of its inputs:
 
-### 18.1 Import Library Parsing
+7. **Overload resolution**: Given the same candidate set and argument types,
+   overload resolution must always select the same winner. This is naturally
+   deterministic in the C++ standard (the rules are fully specified), but the
+   implementation must not depend on the order candidates are discovered. If
+   candidates are collected into a set, that set must be ordered deterministically
+   (e.g., by declaration source location or by a content hash) before ranking.
+
+8. **Template instantiation order**: The order in which templates are instantiated
+   must not affect the result of any individual instantiation. In standard C++,
+   this is guaranteed (instantiations are independent), but implementation
+   shortcuts — such as caching a partially-computed type and reusing it before
+   it is complete — can introduce order-dependence. Each instantiation must see
+   a fully consistent view of the type system.
+
+9. **Name lookup and ADL**: Unqualified name lookup and argument-dependent lookup
+   must produce the same result regardless of which TU triggered the lookup first.
+   Since forgecc caches lookup results, the cache key must include all inputs that
+   affect the result (the name, the argument types, the set of visible declarations
+   in associated namespaces). Two lookups with the same key must return the same
+   result.
+
+10. **Implicit special member generation**: Whether a class's copy constructor,
+    move constructor, destructor, etc. are defaulted, deleted, or trivial must be
+    computed identically regardless of which TU first queries the property. The
+    result depends only on the class definition and its members' properties — not
+    on when or where the query happens.
+
+11. **Constant evaluation**: `constexpr` and `consteval` evaluation must produce
+    identical results for identical inputs. Since forgecc uses JIT for constant
+    evaluation (§4.6a), the JIT'd code must be compiled deterministically (same
+    machine code for the same ForgeIR), and the evaluation must not depend on
+    host-specific state (e.g., stack addresses, allocation addresses). The
+    sandboxed allocator for `constexpr new/delete` must assign deterministic
+    addresses.
+
+12. **SFINAE and concept satisfaction**: Substitution failure detection and concept
+    constraint evaluation must be deterministic. Given the same template arguments
+    and the same set of visible declarations, SFINAE must fail or succeed
+    identically, and concept satisfaction must produce the same boolean result.
+    This is naturally the case if name lookup and overload resolution are
+    deterministic (points 7–9).
+
+13. **Diagnostic emission**: Diagnostics (warnings, errors) must be emitted in a
+    deterministic order. If two warnings are generated in parallel, they must be
+    sorted before output. Diagnostic content must not include non-deterministic
+    information (pointer addresses, thread IDs).
+
+**Verification**: The daemon has a `--verify-determinism` mode that compiles
+everything twice and asserts that all content hashes match — both final outputs
+and intermediate artifacts at every pipeline stage. This catches determinism bugs
+early, whether they originate in output formatting or in pipeline computations.
+
+## 17. JIT Runtime Details
+
+### 17.1 Import Library Parsing
 
 Even in JIT mode, we need `.lib` parsing for **symbol validation** before execution.
 The daemon must know what symbols are available from external DLLs (kernel32, d3d12,
@@ -2180,7 +3341,7 @@ ucrt, vcruntime, etc.) to validate that all references can be resolved.
 
 `forge-link/imports.rs` is therefore needed for **both** JIT and release mode.
 
-### 18.2 Static Initialization Order
+### 17.2 Static Initialization Order
 
 The C++ standard says initialization order of globals across TUs is **unspecified**
 (the "static initialization order fiasco"). Within a single TU, it's top-to-bottom
@@ -2197,7 +3358,7 @@ init order.
 - Order can be arbitrary, or match the order UBT sends compile actions (for compatibility)
 - This is straightforward — just collect function pointers and call them
 
-### 18.3 Thread-Local Storage
+### 17.3 Thread-Local Storage
 
 When JIT-compiling code that uses `__declspec(thread)`, the OS doesn't know about
 the new TLS slots because the module wasn't loaded via `LoadLibrary`. This is the
@@ -2216,7 +3377,7 @@ clang work.
 For the PoC, the `LdrpHandleTlsData` approach is the most pragmatic since it's
 already proven.
 
-### 18.4 Exception Handling
+### 17.4 Exception Handling
 
 SEH and C++ exceptions require `.pdata`/`.xdata` sections and runtime support. In JIT
 mode, we need to register unwind info with `RtlAddFunctionTable` or
@@ -2225,7 +3386,7 @@ mode, we need to register unwind info with `RtlAddFunctionTable` or
 This is well-understood territory — LLVM's ORC JIT does the same thing. The key is
 to call `RtlAddFunctionTable` after mapping code sections and before execution.
 
-### 18.5 Virtual Function Tables
+### 17.5 Virtual Function Tables
 
 In JIT mode, vtables must be laid out correctly and patched when classes are recompiled.
 If a class layout changes (new virtual function, reordered members), all vtable
@@ -2238,7 +3399,7 @@ references must be updated. This requires:
 
 ---
 
-## 19. Live PGO Injection (PoC Feature)
+## 18. Live PGO Injection (PoC Feature)
 
 The daemon's JIT architecture enables a novel form of profile-guided optimization:
 **live PGO injection** without the traditional profile-collect-rebuild cycle.
@@ -2274,7 +3435,7 @@ architecture.
 
 ---
 
-## 20. A VM for C++?
+## 19. A VM for C++?
 
 Yes, essentially. The **forgecc** daemon is a **C++ virtual machine** in the same
 sense that the JVM is a Java VM or the CLR is a .NET VM:
@@ -2297,12 +3458,12 @@ difference is that C++ code runs at full native speed with zero runtime overhead
 
 ---
 
-## 21. Future Work (Beyond the PoC)
+## 20. Future Work (Beyond the PoC)
 
 These are out of scope for the proof-of-concept but are natural extensions of the
 architecture. The design should not preclude them.
 
-### 21.1 Console Development (PS5, Xbox Series X, Nintendo Switch)
+### 20.1 Console Development (PS5, Xbox Series X, Nintendo Switch)
 
 Game studios target consoles alongside PC. The **forgecc** daemon architecture extends
 naturally to console development via a **thin client on the devkit** that communicates
@@ -2400,7 +3561,7 @@ memory writes and process control. The alternative is for **forgecc**-client to
 implement these on top of the existing memory read/write primitives, which is also
 feasible but less efficient.
 
-### 21.2 Artifact Extraction and Release Builds
+### 20.2 Artifact Extraction and Release Builds
 
 During development, **forgecc** keeps everything in the content-addressed store and
 the daemon's memory. For shipping builds, artifacts must be extracted into standard
@@ -2433,6 +3594,151 @@ store from development iteration. The release pipeline is:
 
 This means a release build after a full development session could be **very fast** —
 most of the compilation work is already done and cached.
+
+### 20.3 Rust Front-End
+
+A Rust front-end for forgecc is a natural long-term extension. The motivations are
+complementary:
+
+- **Bootstrapping**: forgecc is written in Rust. A Rust front-end lets forgecc
+  compile itself, closing the bootstrap loop and providing the ultimate dogfooding
+  scenario — every improvement to the compiler immediately benefits its own build.
+- **Mixed C++/Rust codebases**: Game engines are increasingly adopting Rust for
+  systems-level code (gameplay scripting, tooling, asset pipelines). A single daemon
+  that compiles both C++ and Rust, sharing the same content-addressed store and
+  memoization infrastructure, eliminates the overhead of coordinating two separate
+  toolchains. Cross-language LTO and unified debug info become possible.
+- **Faster Rust compilation**: Rust's compile times are a well-known pain point.
+  forgecc's memoization, daemon architecture, and distributed caching apply equally
+  to Rust — the front-end changes, but the entire backend (ForgeIR, codegen, store,
+  JIT, DAP debugger) is reused.
+
+**What a Rust front-end shares with the C++ front-end**:
+
+| Component | Shared? | Notes |
+|---|---|---|
+| Content-addressed store | 100% | Language-agnostic |
+| Memoizer | 100% | Same hash-in/hash-out model |
+| ForgeIR | 100% | Both languages lower to the same IR |
+| x86-64 codegen | 100% | Same backend |
+| Runtime loader / JIT | 100% | Same patching mechanism |
+| DAP debugger | 100% | Same debug info model |
+| Linker | 100% | Same COFF/PE output |
+| Daemon / HTTP server | 100% | New `/v1/compile-rs` endpoint |
+| Distributed P2P | 100% | Same artifact format |
+| Lexer | 0% | Completely different token set |
+| Parser | ~10% | Different grammar; some AST node shapes overlap (functions, structs, enums) |
+| Sema | ~20% | Type checking, trait solving, and borrow checking are unique to Rust; name resolution and overload-like dispatch (trait method selection) share concepts |
+
+**What a Rust front-end requires that the C++ front-end does not**:
+
+1. **Borrow checker** — Rust's defining feature. Implementing Polonius/NLL-style
+   borrow checking is a multi-year effort. The borrow checker is a dataflow
+   analysis over MIR (Mid-level IR), which maps to a ForgeIR analysis pass.
+   Estimated: ~15,000–20,000 lines.
+
+2. **Trait solver** — Rust's trait system (coherence, specialization, auto traits,
+   negative impls, associated types with bounds) is comparable in complexity to
+   C++ template instantiation + overload resolution combined. Estimated:
+   ~8,000–12,000 lines.
+
+3. **Proc macro execution** — Rust's procedural macros are arbitrary Rust code
+   that runs at compile time. Two options: (a) run `rustc`-compiled proc macro
+   `.so`/`.dll` files directly (pragmatic, requires ABI compatibility with
+   `rustc`), or (b) compile proc macros with forgecc itself (requires the Rust
+   front-end to be self-hosting first). Option (a) is the practical starting
+   point.
+
+4. **Pattern matching exhaustiveness** — Rust requires exhaustive pattern matching.
+   This is a well-understood algorithm (Maranget's approach) but still ~2,000–3,000
+   lines.
+
+5. **Lifetime elision and inference** — Implicit lifetime rules that are unique to
+   Rust. ~1,000–2,000 lines.
+
+**Estimated scope**: ~30,000–40,000 lines for a Rust front-end (parser + sema +
+borrow checker + trait solver), on top of the shared infrastructure. This roughly
+doubles the front-end code but adds zero backend code.
+
+**Phasing**: The Rust front-end is strictly post-PoC. The implementation order:
+
+1. Rust lexer + parser (produces Rust AST)
+2. Name resolution + type checking (without borrow checker — produces typed IR)
+3. Lower to ForgeIR (at this point, Rust code compiles and runs but without
+   borrow checking — similar to running with `unsafe` everywhere)
+4. Borrow checker (the hard part — but the code already compiles and runs,
+   so this is a verification pass, not a blocking dependency)
+5. Proc macro support (load `rustc`-compiled proc macro crates)
+6. Self-hosting (forgecc compiles itself)
+
+**Precedent**: The `gccrs` project (Rust front-end for GCC) has been in development
+since 2014 and is still not production-ready, illustrating the difficulty. However,
+forgecc has a structural advantage: the entire backend is already built and tested
+by the time the Rust front-end starts. `gccrs` had to integrate with GCC's backend
+simultaneously. forgecc's Rust front-end is purely additive — it produces ForgeIR,
+and everything downstream works unchanged.
+
+---
+
+## 21. N4950 Cross-Reference (C++23 Standard Draft)
+
+This section documents the results of a systematic cross-reference between this design
+document and N4950 (the C++23 working draft, which includes all C++20 features).
+The cross-reference was performed chapter-by-chapter against the standard's core
+language clauses (§5–§15). Items identified as gaps have been incorporated into the
+relevant sections above.
+
+### 21.1 Coverage Summary by Standard Chapter
+
+| N4950 Chapter | Status | Notes |
+|---|---|---|
+| §5 Lexical conventions | ✅ Covered | Added: raw strings, UDL tokens, hex floats, all encoding prefixes, phases of translation (line splicing, BOM, string concat) |
+| §6 Basics (ODR, scope, lookup, types) | ✅ Covered | ODR handled by content-addressed store; scope/lookup in Sema; added two-phase lookup |
+| §7 Expressions | ✅ Covered | Added: noexcept operator, brace-init lists, UDL expression resolution |
+| §8 Statements | ✅ Covered | if constexpr, if consteval, range-for, structured bindings |
+| §9 Declarations | ✅ Covered | Added: constinit, explicit(bool), extern "C", static_assert, alignas, #pragma pack effects, bit-fields, NSDMI |
+| §10 Modules | ⬜ Not needed | UE5 has zero C++20 module usage |
+| §11 Classes | ✅ Covered | Added: bit-fields, defaulted comparisons, aggregate init, NSDMI |
+| §12 Overloading | ✅ Covered | Added: UDL operator resolution, built-in operator candidates, address of overloaded function |
+| §13 Templates | ✅ Covered | Added: CTAD/deduction guides, template template params, class-type NTTPs, two-phase lookup, variable template instantiation |
+| §14 Exception handling | ✅ Covered | SEH + C++ exceptions; added: noexcept as part of function type |
+| §15 Preprocessing | ✅ Covered | Added: #pragma pack/warning, #line, #error, #warning, __has_builtin, __has_feature, feature-test macros, predefined macros |
+| §16–§33 Library | N/A | We link against MSVC STL; must parse STL headers but don't implement the library |
+
+### 21.2 Intentionally Unsupported (with Justification)
+
+| Feature | N4950 Section | Reason |
+|---|---|---|
+| C++20 Modules | §10 | Zero usage in UE5; memoization replaces the build-time benefit |
+| Coroutines | §7.6.2.4, §17.12 | Zero usage in UE5 Engine/Source/Runtime |
+| `char8_t` as distinct type | §6.8.2 | Recognized by lexer; full type system support deferred (UE5 uses `TCHAR`/`wchar_t`) |
+| Extended float types (`std::float16_t`, etc.) | §6.8.3 | Conditionally-unsupported; lexer recognizes suffixes but rejects them |
+| `std::source_location` compiler magic | §17.8 | Requires `__builtin_source_location()`; deferred to MSVC STL compat phase |
+
+### 21.3 Key Complexity Areas (from Standard Cross-Reference)
+
+These areas of the standard are disproportionately complex relative to their
+specification length and deserve extra attention during implementation:
+
+1. **Overload resolution (§12.2)** — 26 pages in the standard; the most intricate
+   single algorithm in C++. Implicit conversion sequences, partial ordering of
+   function templates, and concept-constrained candidates all interact.
+
+2. **Template argument deduction (§13.10.3)** — 21 pages; deduction from function
+   calls, partial ordering, CTAD, and SFINAE rules are deeply intertwined.
+
+3. **Constant expressions (§7.7)** — 11 pages of rules defining what is and isn't
+   allowed in constexpr context. The JIT approach (§4.6a) simplifies this significantly
+   but UB detection still requires careful instrumentation.
+
+4. **Initialization (§9.4)** — 17 pages covering direct-init, copy-init, list-init,
+   aggregate-init, reference-init, and their interactions with constructors, conversion
+   operators, and `std::initializer_list`. This is where many real-world compilation
+   failures occur.
+
+5. **Name lookup (§6.5)** — 13 pages; unqualified, qualified, ADL, and the interaction
+   with `using` declarations/directives. Two-phase lookup in templates adds another
+   layer.
 
 ---
 

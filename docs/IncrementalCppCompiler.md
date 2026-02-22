@@ -413,7 +413,23 @@ Key:   blake3(input_content + compiler_flags + dependency_hashes)
 Value: the artifact (tokens, AST fragment, IR, machine code section, etc.)
 ```
 
-**Local storage**: An embedded key-value store per machine. Candidates:
+**Single content-store implementation for both index and artifacts**:
+- forgecc uses one custom content-store abstraction for both:
+  - compilation artifacts (tokens/AST/IR/code/debug records)
+  - Merkle/index metadata (build index, dependency signatures, namespace hashes, peer metadata)
+- The build index is not a separate storage system; it is another table/view in the same
+  content-store backend.
+
+**Multi-tier storage hierarchy**:
+- **Tier 0 (memory)**: Hot objects, hash maps, and recently used record pages.
+- **Tier 1 (local SSD)**: Persistent embedded KV pages (redb-backed) with ACID semantics.
+- **Tier 2 (network peers)**: On-demand remote fetch by content hash via P2P endpoints.
+- Read path is `memory → SSD → network`; write path commits to SSD then advertises to peers.
+- Eviction is explicit: cold pages/objects are unloaded from Tier 0 under memory pressure.
+  The OS can still page-process memory, but forgecc does not rely on random swap behavior
+  for cache policy correctness.
+
+**Local persistent backend**:
 - [redb](https://github.com/cberner/redb) — pure Rust, ACID, MVCC, zero-copy reads
 
 **Distributed layer (IPFS-like)**:
@@ -556,6 +572,23 @@ reduce the set of TUs that need any work from hundreds (due to shared headers) t
 the one file that changed. For header changes, it narrows recompilation to only TUs
 that actually use the changed declarations — not all TUs that transitively include
 the header.
+
+**Dependency pruning strategy (anti-thrashing)**:
+
+forgecc avoids "hash the whole world" invalidation by recording only the subset of
+facts that actually affected a result:
+- **Preprocessor pruning**: cache keys shrink from full macro environment to macros
+  that were actually tested/expanded (`#ifdef`, `defined`, expansion sites).
+- **Semantic pruning**: signatures include symbol/type/layout dependencies actually
+  consulted by parse+sema, not entire transitive header text.
+- **ADL pruning**: lookup records include both positive and **negative dependencies**
+  (e.g., `EMPTY_HASH` when no candidate existed), so newly introduced overloads in
+  associated namespaces invalidate precisely.
+- **Namespace pruning**: per-namespace content hashes and version checks avoid rescanning
+  unrelated declarations; global namespace uses partitioned/Merkle hashing.
+
+This pruning model is the primary mechanism that keeps warm-cache hit rates high and
+prevents cache thrashing from unrelated `#define` or declaration churn.
 
 **Implementation note**: This is a Phase 1–3 feature. The dependency signature is built
 incrementally during lexing (macro deps, include deps), parsing (symbol deps), and
@@ -1826,13 +1859,13 @@ forge-daemon
     │   ├── /v1/ml           — assembly actions (forge-ml / llvm-ml equivalent)
     │   ├── /v1/artifact/    — content-addressed artifact get/put (local + P2P)
     │   └── /v1/peers        — peer discovery (gossip protocol)
-    ├── Build Index (output path → content key, persisted in redb)
+    ├── Build Index (output path → content key, same content-store backend)
     ├── P2P Network (seed-based discovery, DHT)
     ├── Build Scheduler (parallel task graph)
     ├── File Watcher (pre-compilation on save)
     ├── Runtime Loader (JIT execution)
     ├── Compilation Thread Pool
-    └── Content-Addressed Store (local redb + distributed DHT)
+    └── Content-Addressed Store (multi-tier: memory → SSD/redb → network/DHT)
 ```
 
 **Build model**:
@@ -1878,6 +1911,10 @@ is ACID, writes are safe even if the daemon crashes mid-update. On restart, the 
 loads the build index from redb — recovery is instant, no recompilation needed. This
 is essentially the daemon's equivalent of a `.ninja_log` file, but stored in the same
 database as all other compilation artifacts.
+
+The same multi-tier store policy applies to build-index pages and artifact pages:
+hot entries remain in memory, warm/cold entries live on SSD, and missing content is
+resolved from peers by hash.
 
 **Workspace binding**: Each daemon instance is bound to a **workspace root** — a
 specific directory tree (git repo, Perforce workspace, or arbitrary source tree):

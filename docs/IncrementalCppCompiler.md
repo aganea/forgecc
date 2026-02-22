@@ -53,9 +53,11 @@
 
 ## 1. Executive Summary
 
-**forgecc** is a proof-of-concept incremental C++20 compiler and linker, written in Rust,
-running as a persistent daemon. Its primary goal is to dramatically reduce build times
-for large C++ codebases (target: Unreal Engine 5+ / Chromium) by:
+**forgecc** is a thought experiment exploring what a C++ compiler could look like if
+designed from scratch around memoization, daemon persistence, and JIT execution. It
+takes the form of an incremental C++20 compiler and linker, written in Rust, running
+as a persistent daemon. Its primary goal is to dramatically reduce build times for
+large C++ codebases (target: Unreal Engine 5+ / Chromium) by:
 
 - **Eliminating redundant work** through fine-grained memoization at every compilation stage
 - **Persisting compilation state** across builds in a content-addressed distributed database

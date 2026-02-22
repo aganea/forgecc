@@ -502,6 +502,16 @@ invalidates everything) and requires manual maintenance. **forgecc**'s approach:
 - Headers included with the same macro state share a single cached result
 - No `SharedPCHHeaderFile`, no `/Yu`/`/Yc` flags, no unity builds
 
+**Macro-set pruning** (two-pass optimization): On the first inclusion, the cache key
+is the full macro environment — a conservative over-approximation. During
+preprocessing, the preprocessor records which macros were actually tested
+(`#ifdef`, `#if defined()`, `#if`, macro expansion). After the first pass, the
+dependency signature stores only those tested macros. On subsequent builds, the
+cache key narrows to just the tested subset. This prevents unrelated `#define`
+changes from invalidating the cache. In practice, a typical UE header tests 5–15
+macros out of 200+ defined on the command line, so the pruned key is dramatically
+more stable.
+
 #### Fine-Grained Dependency Tracking
 
 This is one of the most impactful optimizations **forgecc** can implement, and it is
@@ -738,7 +748,12 @@ struct TemplateInstantiationSignature {
     /// Phase 2 (instantiation-time) dependent name resolutions
     dependent_name_resolutions: BTreeMap<QualifiedName, Blake3Hash>,
 
-    /// ADL results: (unqualified function name, argument type hashes) → winning candidate hash
+    /// ADL results: (unqualified function name, argument type hashes) → winning candidate hash.
+    /// If ADL found no candidates, the value is a sentinel EMPTY_HASH — this is a
+    /// "negative dependency." If someone later adds a matching function to an associated
+    /// namespace, the hash changes and the instantiation is invalidated. Negative
+    /// dependencies are critical for soundness: without them, adding a new overload
+    /// in a seemingly unrelated namespace would not trigger re-instantiation.
     adl_results: BTreeMap<(InternedString, Vec<Blake3Hash>), Blake3Hash>,
 
     /// Overload resolution outcomes: call site → selected candidate hash
@@ -747,7 +762,11 @@ struct TemplateInstantiationSignature {
     /// Concept satisfaction: (concept hash, argument hashes) → satisfied?
     concept_results: BTreeMap<(Blake3Hash, Vec<Blake3Hash>), bool>,
 
-    /// SFINAE: substitution site → success/failure
+    /// SFINAE: substitution site → success/failure.
+    /// Both outcomes are recorded — a substitution that *failed* is a dependency on
+    /// the non-existence of a valid substitution. If a later change makes the
+    /// substitution succeed, the recorded "false" no longer matches and the
+    /// instantiation is invalidated.
     sfinae_results: BTreeMap<SubstitutionSiteId, bool>,
 
     /// Specialization selection: which partial/explicit spec was chosen
@@ -823,9 +842,13 @@ memoized instantiation of `process<game::Actor>` must be invalidated.
 declarations in `namespace game`. Adding `serialize` changes the hash.
 
 **Tier 2 handles this precisely** because `adl_results` records that the call to
-`serialize(x)` resolved to a specific candidate (or failed). On rebuild, we check
-whether the same unqualified lookup with the same argument types still produces the
-same winner.
+`serialize(x)` resolved to a specific candidate — or to *nothing* (a **negative
+dependency**). On rebuild, we check whether the same unqualified lookup with the same
+argument types still produces the same winner. If the original lookup found no
+candidate and a new overload now exists, the sentinel `EMPTY_HASH` no longer matches,
+and the instantiation is invalidated. This "negative cache invalidation" is what makes
+the system sound in the presence of ADL: we track not just what *was* found, but also
+what *was not* found.
 
 **Worst case for ADL**: Types in the global namespace. The global namespace can
 contain thousands of declarations, making the namespace content hash expensive to
@@ -1344,9 +1367,10 @@ constexpr int x = factorial(10);  // needs compile-time evaluation
 1. **Massively reduces Sema complexity**: No need for a ~17,000-line AST interpreter.
    The consteval module becomes ~800 lines of "compile and call" orchestration instead.
 
-2. **Correctness for free**: The compiled code behaves exactly like runtime code because
-   it *is* runtime code. No risk of interpreter bugs where compile-time evaluation
-   disagrees with runtime behavior.
+2. **Lower semantic duplication (not "correctness for free")**: Reusing the normal
+   lowering/codegen path reduces "two implementations of semantics" risk, but it does
+   not eliminate constexpr-specific correctness work. We still need explicit checks for
+   constant-evaluation rules that are stricter than runtime execution.
 
 3. **Performance**: Native execution is orders of magnitude faster than AST interpretation.
    For heavy `constexpr` computation (compile-time string processing, compile-time
@@ -1356,9 +1380,10 @@ constexpr int x = factorial(10);  // needs compile-time evaluation
    `forge-codegen` → map into memory) is the same one used for the runtime loader.
    No new compilation infrastructure needed.
 
-5. **C++20/23/26 constexpr features for free**: As the language adds more features to
-   `constexpr` (dynamic allocation, virtual calls, try-catch), we don't need to update
-   an interpreter — the regular compiler already handles them.
+5. **Better evolution path for new constexpr features**: As the language adds features
+   to `constexpr` (dynamic allocation, virtual calls, try-catch), the shared lowering
+   path reduces maintenance, but each new rule still needs conformance tests and
+   targeted semantic checks in the evaluator.
 
 **Handling transitive calls**: `consteval` functions can call other `constexpr`
 functions, use `std::` algorithms, etc. We compile the entire transitive closure of
@@ -1375,8 +1400,19 @@ Solution: compile `consteval` code with **lightweight sanitizer instrumentation*
 - Division by zero → insert zero-check before division
 - Shift by negative/too-large amount → insert range checks
 
-This is far simpler than a full interpreter because we're just inserting a few extra
-IR instructions during lowering, not reimplementing every language feature.
+This is far simpler than a full AST interpreter because we're inserting checks during
+lowering rather than reimplementing the whole C++ execution model.
+
+**Beyond UB checks**: `constexpr` requires enforcing abstract-machine constraints that
+runtime code may not enforce: allowed side effects, lifetime validity, pointer
+provenance, constant initialization/destruction rules, and forbidden operations in
+constant-evaluation context. These are validated in Sema and a dedicated IR validation
+pass before JIT execution.
+
+**Hybrid evaluator strategy (recommended)**: JIT-first for the common subset, with a
+ForgeIR interpreter fallback for cases where strict abstract-machine tracking is easier
+or safer than native execution. This preserves the "no full AST interpreter" goal while
+maintaining standards conformance.
 
 **Memory allocation in `constexpr`** (C++20): `new`/`delete` are allowed in `constexpr`
 contexts, but all allocations must be freed before evaluation completes. Solution: use
@@ -1388,6 +1424,29 @@ report a compile error.
 `Key = blake3(function_hash + argument_values) → Value = result`. If the same
 `consteval` function is called with the same arguments in a different TU, the result
 is reused without re-execution.
+
+**Cross-compilation and `consteval`**: When the daemon runs on x86-64 Windows but
+compiles for a different target (e.g., aarch64), `consteval` functions
+cannot simply be JIT'd as native x86-64 code — the target may have different
+`sizeof`, `alignof`, endianness, or type-promotion rules, and the C++ standard
+requires `consteval` to evaluate under target semantics. Two strategies:
+
+1. **ForgeIR interpreter fallback**: Evaluate `consteval` by interpreting ForgeIR
+   directly (slower but correct for any target). This is a small interpreter over
+   the SSA graph (~1,500–2,000 lines), not a full C++ AST interpreter — ForgeIR is
+   already lowered past most language complexity.
+
+2. **Embeddable CPU emulator**: JIT-compile the `consteval` function to the *target*
+   architecture's machine code, then execute it under a
+   [QEMU](https://www.qemu.org/)-based emulator. QEMU's CPU core supports ARM,
+   ARM64, x86, RISC-V, MIPS, PowerPC, SPARC, and more. Its user-mode emulation is
+   Linux/BSD-only, but [Unicorn Engine](https://www.unicorn-engine.org/) extracts
+   QEMU's CPU emulation core into an embeddable library that runs natively on
+   Windows x64 (pure C with Rust bindings, thread-safe). This preserves the
+   performance advantage of native execution while honoring target semantics.
+
+For the PoC (x86-64 → x86-64 only), this is not needed — native JIT is correct.
+The emulation path is future work for the console cross-compilation scenario (§20.1).
 
 ### 4.6b ForgeIR — Intermediate Representation
 
@@ -1405,7 +1464,7 @@ and how the alternatives compare:
 | **Rust interop** | Native | FFI to C++ MLIR libraries (or Rust MLIR bindings) | FFI to C++ LLVM (`inkwell` / `llvm-sys` crates) |
 | **Memoization** | Full control over hashing and serialization | Full control | **Hard** — non-deterministic metadata IDs, pointer identity, global numbering make content-addressing difficult |
 | **Determinism** | Full control over ordering | Full control | **Difficult** — many sources of non-determinism (metadata `!0`/`!1` numbering, type uniquing, unnamed value `%0`/`%1` sequencing depend on emission order) |
-| **Incremental granularity** | Function-level (our design) | Function-level (our design) | **Module-level** — LLVM's unit of compilation is a `Module`; splitting below module level is non-trivial |
+| **Incremental granularity** | Function-level (our design) | Function-level (our design) | **Naturally module-oriented** — LLVM's primary unit is a `Module`; function-level reuse is possible but requires additional partitioning/canonicalization infrastructure |
 | **JIT** | Must build loader | Must build loader | **LLVM ORC JIT available** — mature, handles relocations, exception tables, TLS |
 | **Codegen quality (-O0)** | Our codegen (sufficient) | Our codegen (sufficient) | LLVM's codegen (higher quality but overkill for -O0) |
 | **Codegen quality (-O2+)** | Not available | Not available | **Full LLVM optimization pipeline** — critical for release builds |
@@ -1420,10 +1479,11 @@ and how the alternatives compare:
    byte-identical output for identical inputs — LLVM IR makes this hard to
    guarantee without careful canonicalization.
 
-2. **Fine-grained incrementality**: LLVM's unit of compilation is a `Module`.
-   Memoizing at function level (which is what makes forgecc fast on incremental
-   rebuilds) requires splitting/merging LLVM modules per function — this adds
-   significant complexity and fights LLVM's design.
+2. **Fine-grained incrementality**: LLVM is primarily organized around `Module`s.
+   Function-level memoization is possible, but requires non-trivial module
+   partition/merge infrastructure and strict canonicalization to make content hashes
+   stable. That complexity is workable, but higher than a purpose-built function-level
+   pipeline.
 
 LLVM IR does give us a mature JIT (ORC), all SIMD intrinsics for free, and
 production-quality codegen for release builds. We capture these benefits through
@@ -1543,8 +1603,11 @@ patches running code. However, Live Coding is limited:
 - No UCLASS/USTRUCT/UFUNCTION changes
 
 **forgecc**'s approach is more fundamental — the entire application is JIT-compiled, so
-**any** change can be patched (including header changes, new members, layout changes)
-by recompiling and re-linking affected code.
+most body-level changes and many declaration-level changes can be patched by
+recompiling and re-linking affected code. **ABI-shape changes** (class layout, vtable
+shape, base-class changes) require either object migration or a process restart.
+For the PoC, restart-on-ABI-change is the default safety policy; live object migration
+is future work (see §17.5).
 
 **Debugging: DAP-first approach (no PDB generation)**
 
@@ -1568,12 +1631,10 @@ the JIT-compiled application directly.
 - **Watch expressions**: Evaluate using the same consteval JIT infrastructure (§4.6a)
 - **Conditional breakpoints**: Compile the condition, JIT it, evaluate at breakpoint
 
-**What this saves vs. PDB generation**:
-- No PDB writer needed (~2,000-3,000 lines eliminated)
-- No CodeView serialization needed (~1,500 lines eliminated)
-- No need to keep PDB synchronized with live-patched code (PDB is well-documented
-  in LLVM, but the synchronization overhead with JIT-patched code is the real cost)
-- Debug info stays in Sema's internal format — zero serialization overhead
+**What this saves vs. always-on PDB generation in the dev loop**:
+- PDB/CodeView writing is deferred from the primary dev path (still required in release mode)
+- No need to keep on-disk PDB synchronized with each live patch in day-to-day iteration
+- Debug info can stay in the compiler's internal form during development, avoiding repeated serialization
 
 **What DAP costs**:
 - DAP server implementation (~1,500 lines) — well-documented JSON-over-stdio protocol
@@ -1581,7 +1642,8 @@ the JIT-compiled application directly.
   `WriteProcessMemory`, `SetThreadContext`, hardware breakpoints
 - Stack unwinding logic (~500 lines) — simpler than PDB because we control frame layout
 
-**Net savings**: ~1,500-2,000 lines, plus complete avoidance of PDB format complexity.
+**Net effect (PoC)**: lower dev-loop complexity, but not elimination of debug-format
+complexity overall. PDB/CodeView still matters for release builds and ecosystem interop.
 
 **The application requires the daemon to run**: This is a fundamental architectural
 property. The target application can only start if the daemon is up, because the daemon
@@ -1621,6 +1683,14 @@ process happens asynchronously and does not block the build system.
    - Read import libraries (.lib) for Windows SDK / third-party DLLs
    - For interop with external linkers (link.exe, lld), real `.obj` files can be
      materialized from the store on demand (future work, see §4.13)
+
+**ODR merging**: When multiple TUs provide definitions of the same inline function or
+template instantiation (as the One Definition Rule requires), the linker must pick
+exactly one. In a content-addressed system this is naturally deterministic: identical
+definitions produce the same content hash and collapse to a single store entry. For
+ODR-*violating* definitions (different content hashes for the same mangled name), the
+linker emits a hard error and aborts producing a loadable image. The build may expose
+an explicit opt-in escape hatch for investigation, but the default policy is fail-fast.
 
 **UE5 DLL structure**: The Game editor target builds **~190 modules** (see §15.5),
 each as a separate DLL. The `*_API` macro pattern (`CORE_API`, `ENGINE_API`, etc.)
@@ -2499,10 +2569,10 @@ mode (§7.4), bypassing process spawning for all compile/link actions.
 > | Design-heavy but with good references | 1.5–2x faster | Parser, IR design, codegen lowering, linker |
 > | Subtle correctness / deep language semantics | 1–1.5x faster | Sema (templates, overload resolution, concepts), JIT patching, distributed consistency |
 >
-> **Adjusted total**: The ~108 manual weeks could realistically compress to
-> **~36–54 weeks** for one person working full-time with AI assistance. The largest
-> gains come from the lexer/preprocessor, codegen, and linker phases; the smallest
-> from Sema and JIT runtime correctness work.
+> **Adjusted total**: The ~108 manual weeks may compress with AI assistance, but the
+> realistic range depends heavily on Sema/JIT/debugger correctness work. A planning
+> range of **~54–90 weeks** is more defensible; **~36–54 weeks** should be treated as an
+> optimistic best case rather than the baseline expectation.
 
 ### Phase 0: Infrastructure (Weeks 1–4)
 - [ ] Cargo workspace setup
@@ -2687,7 +2757,7 @@ real-world content project before tackling UE5.
   `auto` return types, `consteval` lookup tables (sin/cos, color palettes)
 - [ ] SIMD math: SSE/AVX vector/matrix operations (`__m128`, `_mm_mul_ps`)
 - [ ] SEH: `__try/__except` around D3D calls
-- [ ] STL usage: `std::span`, `std::array`, `std::vector`, `<algorithm>`, `<ranges>`
+- [ ] STL usage: `std::array`, `std::vector`, `<algorithm>` (plus UE-style `TArrayView`/`FMemoryView` patterns, not `std::span`/`std::ranges`)
 - [ ] DLL plugin: `plugin.dll` loaded at runtime — validates DLL generation and import
 - [ ] DAP debugging: set breakpoints in the running demo, inspect variables mid-frame
 - [ ] JIT hot-patching demo: change gravity/color/logic in `physics.cpp` or `scene.cpp`,
@@ -2747,7 +2817,7 @@ build*, target levels describe *what we validate against*.)
 | VI | [**Google Test**](https://github.com/google/googletest) | ~30k | C++14, templates, macros, used by many projects | Templates, macros, exceptions, RTTI |
 | VII | [**LLVM lit test suite**](https://github.com/llvm/llvm-test-suite) (selected C/C++ tests) | varies | Known-good reference tests with expected outputs | Wide coverage |
 | VIII | [**raylib**](https://github.com/raysan5/raylib) + small real-time demo | ~100k | Real-time rendering, game loop, Win32/D3D, multi-TU linking, hot-reload testing | D3D interop, DLL loading, game loop, SIMD, threads, JIT patching of running app |
-| IX | **forge-demo** (purpose-built C++20 showcase) | ~2–5k | Smallest project that exercises *every* phase; interactive real-time app designed for the "wow" demo | C++20 concepts, `consteval` tables, `std::span`/`std::array`, SIMD math, Win32/D3D11, SEH, DLL plugin, DAP debugging, hot-patching live |
+| IX | **forge-demo** (purpose-built C++20 showcase) | ~2–5k | Smallest project that exercises *every* phase; interactive real-time app designed for the "wow" demo | C++20 concepts, `consteval` tables, `std::array`/`std::vector` (+ UE-style view wrappers), SIMD math, Win32/D3D11, SEH, DLL plugin, DAP debugging, hot-patching live |
 | X | **UE5 Lyra demo** / Game editor | ~millions | Full target | Everything |
 
 **Target level IX — forge-demo**: No single small open-source project exercises all
@@ -2770,7 +2840,7 @@ forge-demo/
 |---|---|---|
 | 1 | Preprocessor, Windows SDK headers | `#include <windows.h>`, `#include <d3d11.h>`, conditional compilation |
 | 2 | C++20 parser | `concept`, `requires`, structured bindings, `if constexpr`, `auto` return types |
-| 3 | Templates, concepts, `consteval`, STL, SEH | `concept Renderable`, `consteval` color/math tables, `std::span`/`std::array`, `__try/__except` around D3D calls |
+| 3 | Templates, concepts, `consteval`, STL, SEH | `concept Renderable`, `consteval` color/math tables, `std::array`/`std::vector` (+ UE-style view wrappers), `__try/__except` around D3D calls |
 | 4 | x86-64 codegen, SIMD | `__m128`/`_mm_mul_ps` for transforms, hand-written SIMD math |
 | 5 | JIT, live patching, DLL imports | Entire app runs via JIT; changing `physics.cpp` patches the running app live |
 | 6 | `consteval` via JIT | `consteval` sin/cos tables, color palettes, vertex data |
@@ -2851,14 +2921,16 @@ debugging individual compilation issues.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| C++ corner cases in Sema | Very High | High | Focus on UE5/Game's subset; fail gracefully on unsupported features; incremental target codebases (§8a) |
+| C++ corner cases in Sema | Very High | Critical | Focus on UE5/Game's subset; fail gracefully on unsupported features; incremental target codebases (§8a) |
 | MSVC ABI incompatibility | High | Critical | Extensive testing against MSVC-compiled code; `forge-verify` (§8b) + `llvm-debuginfo-analyzer` |
-| JIT execution stability | High | High | Hybrid mode as fallback; JIT is optional |
+| JIT execution stability (loader, patching, unwind/TLS) | Very High | Critical | Two dev modes: hot-patch for body-safe edits, restart-on-ABI-change for safety; staged rollout by target level |
+| ABI-shape hot-reload (layout/vtable changes) | High | Critical | ABI epoch tracking, generated migrators + optional user callbacks, hard fallback to process restart when unsafe |
+| Debugger parity / tooling ecosystem gap | High | High | DAP-first for dev loop, but keep release-mode PDB/CodeView path and interoperability tests |
 | Performance of unoptimized code | Medium | Medium | UE5 debug builds are already unoptimized; acceptable |
 | SIMD intrinsic coverage | Medium | High | Map intrinsics incrementally; start with SSE2, add SSE4/AVX as needed |
-| Windows SDK header complexity | High | Medium | Test incrementally; many headers are already handled by preprocessor |
-| Distributed store consistency | Low | Low | Content-addressed = deterministic; eventual consistency is fine |
-| Parallelism correctness | Medium | High | Rust's ownership model helps; extensive testing with thread sanitizer |
+| Windows SDK header complexity | High | High | Test incrementally; many headers are already handled by preprocessor |
+| Distributed store consistency / trust boundaries | Medium | High | Determinism verification (`--verify-determinism`), protocol/version checks, content-hash verification, bounded peer trust |
+| Parallelism correctness | Medium | High | Rust ownership helps, but require deterministic merge order and stress/fuzz testing of concurrent paths |
 
 ---
 
@@ -3266,6 +3338,19 @@ Reference: [Deterministic builds with clang and lld](https://blog.llvm.org/2019/
    deterministic within a TU, so it's fine. But we must ensure it doesn't leak across
    TU boundaries.
 
+6b. **Floating-point determinism**: Floating-point constant folding and `constexpr`
+   evaluation must produce identical results across machines. This means:
+   - All compile-time floating-point arithmetic uses IEEE 754 semantics with a fixed
+     rounding mode (round-to-nearest-even), regardless of the host FPU state.
+   - `-ffast-math` / `/fp:fast` flags affect *codegen* (what instructions are emitted)
+     but not *compile-time evaluation*. The flag is part of the cache key, so different
+     FP modes produce different hashes — but the same flag always produces the same output.
+   - Cross-compilation between x86 (80-bit extended precision intermediates) and ARM
+     (64-bit double intermediates) can produce different constant-folding results. Since
+     forgecc targets Windows x86-64 for the PoC, this is not an immediate concern, but
+     the `constexpr` evaluator should use strict 64-bit double semantics (no extended
+     precision) to be forward-compatible with cross-machine distributed builds.
+
 **Pipeline computation determinism**:
 
 The points above cover *output* determinism (what bytes end up in the store). But
@@ -3396,8 +3481,22 @@ references must be updated. This requires:
 - Tracking which vtables reference which functions
 - When a class is recompiled with a layout change, update the vtable and all objects
   that point to it
-- For the PoC, layout changes could trigger a full restart of the target process
-  (acceptable for a PoC; Live Coding has the same limitation)
+
+**ABI-shape updates (layout/vtable/base-class changes) — practical strategy**:
+
+1. **ABI epoch per type**: Each class layout has a stable shape hash (ABI epoch).
+   Recompiled code is tagged with the epoch it expects.
+2. **Dual-code coexistence**: Old and new code may coexist temporarily. Call boundaries
+   crossing epochs are mediated through generated thunks/adapters where safe.
+3. **Object migration path (future)**:
+   - Generated field-wise migrators for trivially mappable cases
+   - Optional user callbacks for custom migration/serialization of complex state
+   - Heap objects can be migrated at safepoints; stack objects are not migrated
+4. **Safety rule**: If a safe migration/adaptation path cannot be proven, force a
+   process restart. Correctness beats hot-reload convenience.
+
+For the PoC, the default policy is conservative: **restart on ABI-shape change**.
+This keeps behavior correct while body-only edits remain hot-patchable.
 
 ---
 

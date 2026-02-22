@@ -3512,6 +3512,40 @@ Every stage must be a pure function of its inputs:
     sorted before output. Diagnostic content must not include non-deterministic
     information (pointer addresses, thread IDs).
 
+**Enforcing referential transparency in code**:
+
+Deterministic intent is not sufficient. forgecc enforces stage purity with hard
+code-structure constraints:
+
+1. **Pure stage boundary**: Every memoized stage is a pure function:
+   `StageOutput = run(StageInput)`. Every dependency that can affect output is
+   present in `StageInput` and therefore in the content hash key.
+
+2. **Core/runtime split**: Each stage is split into:
+   - `*-core` module/crate: pure computation only
+   - `*-runtime` module/crate: I/O, networking, filesystem, process state
+   The runtime layer constructs `StageInput`; the core layer computes `StageOutput`.
+
+3. **No ambient state in core**: Core code does not read wall clock, RNG, env vars,
+   filesystem, network, current directory, locale, or global mutable singletons.
+
+4. **Disallowed stateful types in core**: Core code does not accept or store shared
+   mutable handles such as `Arc<Mutex<_>>`, `Arc<RwLock<_>>`, `DashMap`, interior-
+   mutable globals, or atomics that influence semantic output. `Arc<T>` is allowed only
+   for immutable `T`.
+
+5. **Type-level API gating**: Impure service types (`Store`, `Clock`, `NetClient`,
+   `Env`, `Logger` with side effects) are not exposed to core crates. If a function can
+   observe mutable external state, it is not part of a memoized core stage.
+
+6. **Lint and CI gates**: Pure crates run deny-by-default lint rules for disallowed
+   imports/types and fail CI on violations. Determinism CI replays the same action
+   twice in separate processes and compares intermediate and final artifact hashes.
+
+7. **Fail-closed policy**: If a stage cannot prove complete input closure, the stage is
+   marked non-cacheable and emits a diagnostic in verification mode. forgecc never
+   silently caches impure computations.
+
 **Verification**: The daemon has a `--verify-determinism` mode that compiles
 everything twice and asserts that all content hashes match — both final outputs
 and intermediate artifacts at every pipeline stage. This catches determinism bugs

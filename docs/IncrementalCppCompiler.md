@@ -2715,6 +2715,11 @@ mode (§7.4), bypassing process spawning for all compile/link actions.
 > range of **~54–90 weeks** is more defensible; **~36–54 weeks** should be treated as an
 > optimistic best case rather than the baseline expectation.
 
+**De-risking priority rule**: Highest semantic-risk components are implemented and
+validated before feature breadth. Template-instantiation memoization and invalidation
+correctness are front-loaded in the plan because they are on the critical path for
+incremental performance and correctness.
+
 ### Phase 0: Infrastructure (Weeks 1–4)
 - [ ] Cargo workspace setup
 - [ ] `forge-store`: Content-addressed local store on redb, build index table
@@ -2784,6 +2789,14 @@ a valid `build.ninja` referencing forge-cc.
 - [ ] Name lookup (including two-phase lookup for templates), type checking (parallel
   where possible)
 - [ ] Template instantiation with Tier 1 memoization (structural key — see §4.2)
+- [ ] **Template memoization de-risk track (front-loaded)**:
+  - [ ] Implement Tier 2 dependency-signature recording for a focused template subset
+    (`std::vector`, traits, selected UE containers) before full language breadth
+  - [ ] Add negative-dependency recording for ADL/concept lookups in this subset
+  - [ ] Add signature-cost telemetry (`hashes checked`, `lookup count`, `validate-us`)
+    and enforce budget thresholds in CI
+  - [ ] Run controlled edit-sequence tests (body edit, overload add/remove, namespace
+    injection, macro flip) and require deterministic invalidation outcomes
 - [ ] CTAD: deduction guide synthesis, implicit guides from constructors, aggregate
   deduction guides
 - [ ] Template template parameters, class-type NTTPs (structural types)
@@ -2930,10 +2943,11 @@ correctly on this project before moving to UE5.
 - [ ] Cross-machine artifact sharing
 - [ ] Benchmark: two machines sharing compilation work
 - [ ] File watching and pre-compilation
-- [ ] Template instantiation memoization Tier 2 (recorded dependency signatures — see §4.2):
-  profile UE5 builds to identify most-instantiated templates, instrument dependency
-  recording, validate signature cost stays within budget
-- [ ] Namespace content hash caching (Tier 3) for associated-namespace lookups
+- [ ] Template memoization scale tuning (Tier 2/Tier 3 already implemented earlier):
+  profile UE5/Game builds to refine dependency-signature granularity and reduce
+  over-invalidation under real workloads
+- [ ] Namespace hash/index scale tuning: bucket sizing, Merkle partition policy, and
+  validation-cost profiling for associated-namespace lookups
 
 **Milestone**: Two machines share compilation work via P2P network.
 
@@ -3055,6 +3069,28 @@ reference compiler.
 **Usage for development**: During development, `forge-verify --single foo.cpp` compiles
 a single file with both **forgecc** and clang-cl, then diffs the results — useful for
 debugging individual compilation issues.
+
+**Incremental correctness test framework (required for an incremental compiler)**:
+
+- **Edit-sequence tests as first-class citizens**: each test defines `S0 -> S1 -> S2 ...`
+  source revisions and expected outcomes at each step (cache hit/miss, invalidation set,
+  compile result, runtime output).
+- **Deterministic invalidation assertions**: for each revision transition, `forge-verify`
+  checks that the invalidated unit set and produced artifacts are stable across repeated runs.
+- **Differential incremental mode**: each transition is run both incrementally and from
+  clean state; outputs and diagnostics must match.
+- **Template stress suites**: dedicated suites for ADL/SFINAE/concepts/two-phase lookup
+  transitions where tiny source edits historically trigger broad recomputation.
+
+**Fuzzing roadmap (staged)**:
+
+- **Phase 3 onward**: grammar-aware mutational fuzzing for parser+sema with crash-only
+  oracles and reducer integration.
+- **After Tier 2 memoization is active**: stateful incremental fuzzing generates edit
+  sequences and checks invariants (`incremental == clean`, deterministic invalidation,
+  no stale-cache acceptance).
+- **Later (Phase 8+)**: differential fuzzing against clang-cl/MSVC for diagnostics,
+  codegen structure, and runtime behavior on generated corpora.
 
 ---
 
